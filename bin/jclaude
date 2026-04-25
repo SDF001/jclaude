@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+APP_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+JAR="$APP_DIR/target/jclaude-0.1.0.jar"
+
+if [ ! -f "$JAR" ]; then
+  echo "jclaude: $JAR not found. Run 'mvn package' first." >&2
+  exit 1
+fi
+
+exec java -jar "$JAR" "$@"
