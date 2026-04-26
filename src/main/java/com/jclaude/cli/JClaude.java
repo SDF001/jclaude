@@ -38,7 +38,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 public final class JClaude {
-    private static final String VERSION = "0.1.1";
+    private static final String VERSION = "0.1.2";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
@@ -51,7 +51,6 @@ public final class JClaude {
     private static final int SKILL_LISTING_CHAR_BUDGET = 8_000;
     private static final String SESSION_ID = "jclaude-" + UUID.randomUUID();
     private static final Pattern FRONTMATTER_PATTERN = Pattern.compile("\\A---\\s*\\R(.*?)\\R---\\s*\\R?(.*)\\z", Pattern.DOTALL);
-    private static final int MAX_TOOL_TURNS = 20;
     private static final int MAX_TOOL_READ_LINES = 2_000;
     private static final long MAX_TOOL_TEXT_FILE_BYTES = 2_000_000L;
     private static final int DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
@@ -85,6 +84,9 @@ public final class JClaude {
                 return runPrintMode(request);
             }
             return runInteractive(request);
+        } catch (MaxToolTurnsException exception) {
+            System.err.println(maxTurnsMessage(exception.maxTurns()));
+            return 1;
         } catch (CliException exception) {
             System.err.println("jclaude: " + exception.getMessage());
             System.err.println("Try 'jclaude --help' for usage.");
@@ -129,37 +131,49 @@ public final class JClaude {
         PromptInput promptInput = PromptInput.parse(prompt);
         String outputFormat = config.outputFormat();
         String model = config.model();
-        if ("json".equals(outputFormat)) {
-            String response = responseFor(List.of(promptInput.toChatMessage()), config, false);
-            System.out.println(toJson(Map.of(
-                    "type", "assistant_message",
-                    "model", model,
-                    "content", response
-            )));
-        } else if ("stream-json".equals(outputFormat)) {
-            System.out.println(toJson(Map.of("type", "message_start", "model", model)));
-            responseForStreaming(
-                    List.of(promptInput.toChatMessage()),
-                    config,
-                    agentSession,
-                    false,
-                    (Consumer<String>) chunk -> System.out.println(toJson(Map.of("type", "content_block_delta", "text", chunk)))
-            );
-            System.out.println(toJson(Map.of("type", "message_stop")));
-        } else if ("text".equals(outputFormat)) {
-            responseForStreaming(
-                    List.of(promptInput.toChatMessage()),
-                    config,
-                    agentSession,
-                    false,
-                    (Consumer<String>) chunk -> {
-                        System.out.print(chunk);
-                        System.out.flush();
-                    }
-            );
-            System.out.println();
-        } else {
-            throw new CliException("Unsupported output format: " + outputFormat);
+        Integer maxTurns = request.maxTurns();
+        try {
+            if ("json".equals(outputFormat)) {
+                String response = responseFor(List.of(promptInput.toChatMessage()), config, false, maxTurns);
+                System.out.println(toJson(Map.of(
+                        "type", "assistant_message",
+                        "model", model,
+                        "content", response
+                )));
+            } else if ("stream-json".equals(outputFormat)) {
+                System.out.println(toJson(Map.of("type", "message_start", "model", model)));
+                responseForStreaming(
+                        List.of(promptInput.toChatMessage()),
+                        config,
+                        agentSession,
+                        false,
+                        maxTurns,
+                        (Consumer<String>) chunk -> System.out.println(toJson(Map.of("type", "content_block_delta", "text", chunk)))
+                );
+                System.out.println(toJson(Map.of("type", "message_stop")));
+            } else if ("text".equals(outputFormat)) {
+                PlainTextStreamingObserver observer = new PlainTextStreamingObserver();
+                try {
+                    responseForStreaming(
+                            List.of(promptInput.toChatMessage()),
+                            config,
+                            agentSession,
+                            false,
+                            maxTurns,
+                            observer
+                    );
+                    observer.finish();
+                } catch (MaxToolTurnsException exception) {
+                    observer.finish();
+                    System.out.println(maxTurnsMessage(exception.maxTurns()));
+                    return 1;
+                }
+            } else {
+                throw new CliException("Unsupported output format: " + outputFormat);
+            }
+        } catch (MaxToolTurnsException exception) {
+            emitMaxTurnsError(outputFormat, model, exception.maxTurns());
+            return 1;
         }
         return 0;
     }
@@ -199,33 +213,47 @@ public final class JClaude {
                     List<ChatMessage> nextMessages = new ArrayList<>(history);
                     nextMessages.add(new ChatMessage("user", invocation.get().expandedPrompt()));
                     InteractiveStreamingObserver observer = new InteractiveStreamingObserver();
-                    String response = responseForStreaming(
-                            nextMessages,
-                            config,
-                            agentSession,
-                            true,
-                            observer
-                    );
+                    try {
+                        String response = responseForStreaming(
+                                nextMessages,
+                                config,
+                                agentSession,
+                                true,
+                                null,
+                                observer
+                        );
+                        history.clear();
+                        history.addAll(nextMessages);
+                        history.add(new ChatMessage("assistant", response));
+                    } catch (MaxToolTurnsException exception) {
+                        observer.finish();
+                        System.out.println(maxTurnsMessage(exception.maxTurns()));
+                        continue;
+                    }
                     observer.finish();
-                    history.clear();
-                    history.addAll(nextMessages);
-                    history.add(new ChatMessage("assistant", response));
                     continue;
                 }
                 List<ChatMessage> nextMessages = new ArrayList<>(history);
                 nextMessages.add(promptInput.toChatMessage());
                 InteractiveStreamingObserver observer = new InteractiveStreamingObserver();
-                String response = responseForStreaming(
-                        nextMessages,
-                        config,
-                        agentSession,
-                        true,
-                        observer
-                );
+                try {
+                    String response = responseForStreaming(
+                            nextMessages,
+                            config,
+                            agentSession,
+                            true,
+                            null,
+                            observer
+                    );
+                    history.clear();
+                    history.addAll(nextMessages);
+                    history.add(new ChatMessage("assistant", response));
+                } catch (MaxToolTurnsException exception) {
+                    observer.finish();
+                    System.out.println(maxTurnsMessage(exception.maxTurns()));
+                    continue;
+                }
                 observer.finish();
-                history.clear();
-                history.addAll(nextMessages);
-                history.add(new ChatMessage("assistant", response));
             }
         }
     }
@@ -464,24 +492,32 @@ public final class JClaude {
     }
 
     private String responseFor(String prompt, EffectiveConfig config) throws IOException {
-        return responseFor(List.of(PromptInput.parse(prompt).toChatMessage()), config, false);
+        return responseFor(List.of(PromptInput.parse(prompt).toChatMessage()), config, false, null);
     }
 
     private String responseFor(List<ChatMessage> messages, EffectiveConfig config, boolean allowDestructiveConfirmation) throws IOException {
-        return responseFor(messages, config, new AgentSession(), allowDestructiveConfirmation);
+        return responseFor(messages, config, allowDestructiveConfirmation, null);
     }
 
-    private String responseFor(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation) throws IOException {
+    private String responseFor(List<ChatMessage> messages, EffectiveConfig config, boolean allowDestructiveConfirmation, Integer maxToolTurns) throws IOException {
+        return responseFor(messages, config, new AgentSession(), allowDestructiveConfirmation, maxToolTurns);
+    }
+
+    private String responseFor(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation, Integer maxToolTurns) throws IOException {
         StringBuilder response = new StringBuilder();
-        responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, (Consumer<String>) response::append);
+        responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, maxToolTurns, (Consumer<String>) response::append);
         return response.toString();
     }
 
     private String responseForStreaming(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation, Consumer<String> onText) throws IOException {
-        return responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, StreamingObserver.forText(onText));
+        return responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, null, StreamingObserver.forText(onText));
     }
 
-    private String responseForStreaming(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation, StreamingObserver observer) throws IOException {
+    private String responseForStreaming(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation, Integer maxToolTurns, Consumer<String> onText) throws IOException {
+        return responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, maxToolTurns, StreamingObserver.forText(onText));
+    }
+
+    private String responseForStreaming(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation, Integer maxToolTurns, StreamingObserver observer) throws IOException {
         if (config.apiKey().isEmpty()) {
             String response = localResponse(messages.getLast(), config.provider(), config.skills());
             observer.onText(response);
@@ -496,6 +532,7 @@ public final class JClaude {
                     config.skills(),
                     agentSession,
                     allowDestructiveConfirmation,
+                    maxToolTurns,
                     observer
             );
             case OPENAI -> openAiStreamingToolLoop(
@@ -506,9 +543,47 @@ public final class JClaude {
                     config.skills(),
                     agentSession,
                     allowDestructiveConfirmation,
+                    maxToolTurns,
                     observer
             );
         };
+    }
+
+    private void emitMaxTurnsError(String outputFormat, String model, int maxTurns) {
+        String message = maxTurnsErrorDetail(maxTurns);
+        switch (outputFormat) {
+            case "json" -> {
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("type", "result");
+                result.put("subtype", "error_max_turns");
+                result.put("is_error", true);
+                result.put("model", model);
+                result.put("max_turns", maxTurns);
+                result.put("error", message);
+                System.out.println(toJson(result));
+            }
+            case "stream-json" -> {
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("type", "result");
+                result.put("subtype", "error_max_turns");
+                result.put("is_error", true);
+                result.put("model", model);
+                result.put("max_turns", maxTurns);
+                result.put("error", message);
+                System.out.println(toJson(result));
+                System.out.println(toJson(Map.of("type", "message_stop")));
+            }
+            case "text" -> System.out.println(System.lineSeparator() + maxTurnsMessage(maxTurns));
+            default -> throw new CliException("Unsupported output format: " + outputFormat);
+        }
+    }
+
+    private String maxTurnsMessage(int maxTurns) {
+        return "Error: Reached max turns (" + maxTurns + ")";
+    }
+
+    private String maxTurnsErrorDetail(int maxTurns) {
+        return "Reached maximum number of turns (" + maxTurns + ")";
     }
 
     private String systemPrompt(SkillRegistry skills, AgentSession agentSession) {
@@ -555,12 +630,13 @@ public final class JClaude {
             SkillRegistry skills,
             AgentSession agentSession,
             boolean allowDestructiveConfirmation,
+            Integer maxToolTurns,
             StreamingObserver observer
     ) throws IOException {
         List<Map<String, Object>> payloadMessages = new ArrayList<>(anthropicMessagePayload(messages));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
         StringBuilder fullResponse = new StringBuilder();
-        for (int turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+        for (int turn = 0; maxToolTurns == null || turn < maxToolTurns; turn++) {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
             body.put("max_tokens", 16_000);
@@ -607,7 +683,7 @@ public final class JClaude {
             }
             payloadMessages.add(Map.of("role", "user", "content", toolResults));
         }
-        throw new CliException("Tool loop exceeded maximum turns (" + MAX_TOOL_TURNS + ")");
+        throw new MaxToolTurnsException(maxToolTurns);
     }
 
     private StreamingAnthropicTurn anthropicStreamingToolTurn(
@@ -702,12 +778,13 @@ public final class JClaude {
             SkillRegistry skills,
             AgentSession agentSession,
             boolean allowDestructiveConfirmation,
+            Integer maxToolTurns,
             StreamingObserver observer
     ) throws IOException {
         List<Map<String, Object>> payloadMessages = new ArrayList<>(openAiMessagePayload(messages, systemPrompt(skills, agentSession)));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
         StringBuilder fullResponse = new StringBuilder();
-        for (int turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+        for (int turn = 0; maxToolTurns == null || turn < maxToolTurns; turn++) {
             if (turn > 0 && !payloadMessages.isEmpty() && "system".equals(payloadMessages.getFirst().get("role"))) {
                 payloadMessages.set(0, Map.of("role", "system", "content", systemPrompt(skills, agentSession)));
             }
@@ -740,7 +817,7 @@ public final class JClaude {
                 payloadMessages.add(toolMessage);
             }
         }
-        throw new CliException("Tool loop exceeded maximum turns (" + MAX_TOOL_TURNS + ")");
+        throw new MaxToolTurnsException(maxToolTurns);
     }
 
     private StreamingOpenAiTurn openAiStreamingToolTurn(
@@ -1134,6 +1211,18 @@ public final class JClaude {
         return null;
     }
 
+    private static int parsePositiveCliInt(String optionName, String rawValue) {
+        try {
+            int parsed = Integer.parseInt(rawValue);
+            if (parsed < 1) {
+                throw new CliException(optionName + " must be >= 1");
+            }
+            return parsed;
+        } catch (NumberFormatException exception) {
+            throw new CliException(optionName + " must be an integer");
+        }
+    }
+
     private String readStdin() throws IOException {
         Console console = System.console();
         if (console != null) {
@@ -1153,6 +1242,7 @@ public final class JClaude {
                   -p, --print                   Print response and exit
                       --output-format <format>  text, json, or stream-json
                       --input-format <format>   text or stream-json placeholder
+                      --max-turns <turns>       Maximum number of agentic turns in non-interactive mode (only works with --print)
                       --model <model>           Model name to use
                       --provider <provider>     anthropic or openai
                       --base-url <url>          Override provider base URL or full endpoint
@@ -1187,18 +1277,30 @@ public final class JClaude {
                 """);
     }
 
-    private String toJson(Map<String, String> values) {
+    private String toJson(Map<String, ?> values) {
         StringBuilder builder = new StringBuilder("{");
         boolean first = true;
-        for (Map.Entry<String, String> entry : values.entrySet()) {
+        for (Map.Entry<String, ?> entry : values.entrySet()) {
             if (!first) {
                 builder.append(',');
             }
             first = false;
             builder.append('"').append(escapeJson(entry.getKey())).append("\":");
-            builder.append('"').append(escapeJson(entry.getValue())).append('"');
+            appendJsonValue(builder, entry.getValue());
         }
         return builder.append('}').toString();
+    }
+
+    private void appendJsonValue(StringBuilder builder, Object value) {
+        if (value == null) {
+            builder.append("null");
+            return;
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            builder.append(value);
+            return;
+        }
+        builder.append('"').append(escapeJson(String.valueOf(value))).append('"');
     }
 
     private String escapeJson(String value) {
@@ -1541,6 +1643,10 @@ public final class JClaude {
         @Override
         public void onToolEnd(ToolCall toolCall, String result) {
             clearStatus();
+            if ("Read".equals(toolCall.name())) {
+                lineStart = true;
+                return;
+            }
             System.out.println(toolEndSummary(toolCall, result));
             System.out.flush();
             sawOutput = true;
@@ -1564,6 +1670,30 @@ public final class JClaude {
             System.out.flush();
             statusActive = false;
             lineStart = true;
+        }
+    }
+
+    private static final class PlainTextStreamingObserver implements StreamingObserver {
+        private boolean lineStart = true;
+        private boolean sawOutput;
+
+        @Override
+        public void onText(String chunk) {
+            if (chunk == null || chunk.isEmpty()) {
+                return;
+            }
+            System.out.print(chunk);
+            System.out.flush();
+            sawOutput = true;
+            lineStart = chunk.endsWith("\n") || chunk.endsWith("\r");
+        }
+
+        void finish() {
+            if (!lineStart || !sawOutput) {
+                System.out.println();
+                System.out.flush();
+                lineStart = true;
+            }
         }
     }
 
@@ -3064,14 +3194,27 @@ public final class JClaude {
                     || Character.isISOControl(codePoint)) {
                 return 0;
             }
-            Character.UnicodeScript script = Character.UnicodeScript.of(codePoint);
-            if (script == Character.UnicodeScript.HAN
-                    || script == Character.UnicodeScript.HIRAGANA
-                    || script == Character.UnicodeScript.KATAKANA
-                    || script == Character.UnicodeScript.HANGUL) {
-                return 2;
-            }
-            return 1;
+            return isWideCodePoint(codePoint) ? 2 : 1;
+        }
+
+        private static boolean isWideCodePoint(int codePoint) {
+            return codePoint >= 0x1100 && (
+                    codePoint <= 0x115F
+                            || codePoint == 0x2329
+                            || codePoint == 0x232A
+                            || (codePoint >= 0x2E80 && codePoint <= 0xA4CF && codePoint != 0x303F)
+                            || (codePoint >= 0xAC00 && codePoint <= 0xD7A3)
+                            || (codePoint >= 0xF900 && codePoint <= 0xFAFF)
+                            || (codePoint >= 0xFE10 && codePoint <= 0xFE19)
+                            || (codePoint >= 0xFE30 && codePoint <= 0xFE6F)
+                            || (codePoint >= 0xFF00 && codePoint <= 0xFF60)
+                            || (codePoint >= 0xFFE0 && codePoint <= 0xFFE6)
+                            || (codePoint >= 0x1F300 && codePoint <= 0x1F64F)
+                            || (codePoint >= 0x1F680 && codePoint <= 0x1F6FF)
+                            || (codePoint >= 0x1F900 && codePoint <= 0x1F9FF)
+                            || (codePoint >= 0x20000 && codePoint <= 0x2FFFD)
+                            || (codePoint >= 0x30000 && codePoint <= 0x3FFFD)
+            );
         }
 
         private static int detectTerminalColumns() {
@@ -3811,6 +3954,12 @@ public final class JClaude {
         Optional<String> option(String name) {
             return Optional.ofNullable(options.get(name));
         }
+
+        Integer maxTurns() {
+            return option("max-turns")
+                    .map(value -> parsePositiveCliInt("--max-turns", value))
+                    .orElse(null);
+        }
     }
 
     private static final class CliParser {
@@ -3822,7 +3971,7 @@ public final class JClaude {
                 "-r", "resume"
         );
         private static final Set<String> VALUE_OPTIONS = Set.of(
-                "output-format", "input-format", "model", "provider", "base-url", "allowed-tools", "disallowed-tools",
+                "output-format", "input-format", "max-turns", "model", "provider", "base-url", "allowed-tools", "disallowed-tools",
                 "mcp-config", "permission-mode", "resume", "settings", "add-dir", "agents"
         );
 
@@ -3896,6 +4045,19 @@ public final class JClaude {
     private static final class CliException extends RuntimeException {
         CliException(String message) {
             super(Objects.requireNonNull(message));
+        }
+    }
+
+    private static final class MaxToolTurnsException extends RuntimeException {
+        private final int maxTurns;
+
+        MaxToolTurnsException(int maxTurns) {
+            super("Tool loop exceeded maximum turns (" + maxTurns + ")");
+            this.maxTurns = maxTurns;
+        }
+
+        int maxTurns() {
+            return maxTurns;
         }
     }
 }

@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 APP_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-JAR="$APP_DIR/target/jclaude-0.1.1.jar"
+JAR="$APP_DIR/target/jclaude-0.1.2.jar"
 
 if [ ! -f "$JAR" ]; then
   echo "jclaude: $JAR not found. Run 'mvn package' first." >&2

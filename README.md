@@ -1,6 +1,6 @@
 # jclaude
 
-`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.1`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
+`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.2`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
 
 - `anthropic`：Anthropic Messages API 格式，调用 `/v1/messages`，支持 SSE 流式输出和 tool use。
 - `openai`：OpenAI-compatible Chat Completions 格式，调用 `/v1/chat/completions`，可用于 DeepSeek 等兼容 OpenAI API 的服务，支持 SSE 流式输出和 function tools。
@@ -19,6 +19,7 @@
 - 支持可选 Plan Mode：复杂或高风险任务可以先只读分析和制定计划，用户批准后再允许修改。
 - OpenAI-compatible provider 会保留并续传 DeepSeek 等模型返回的 `reasoning_content`，兼容 thinking mode 多轮工具调用。
 - 交互模式会显示 `思考中...`、工具开始和工具结果状态，避免多轮工具调用时文本挤在同一行。
+- `-p` 非交互模式支持 `--max-turns <N>` 限制 agentic turns；交互模式默认不限制。
 - 交互输入支持 `/` 命令补全、`@` 文件补全、光标左右移动、输入历史和长行横向滚动。
 - 支持本地 skills、图片输入、配置文件和 Anthropic/OpenAI-compatible provider。
 
@@ -31,7 +32,7 @@ mvn package
 构建完成后会生成：
 
 ```sh
-target/jclaude-0.1.1.jar
+target/jclaude-0.1.2.jar
 ```
 
 ## 启动项目
@@ -51,7 +52,7 @@ mvn package
 ### 方式二：直接运行 jar
 
 ```sh
-java -jar target/jclaude-0.1.1.jar --help
+java -jar target/jclaude-0.1.2.jar --help
 ```
 
 ## 基本用法
@@ -484,7 +485,7 @@ JSON
 1. 构造包含系统提示、会话历史和工具定义的请求，并设置 `stream=true`。
 2. 通过 SSE 逐条读取 `data:` JSON 事件，文本 delta 会立即输出给终端或 JSONL。
 3. 如果模型发起工具调用，`jclaude` 执行对应本地工具，并把工具结果追加回对话。
-4. 继续下一轮流式请求，直到模型不再调用工具或达到最大工具轮次。
+4. 继续下一轮流式请求，直到模型不再调用工具；如果在 `-p` 非交互模式下显式设置了 `--max-turns`，达到上限后会停止并返回错误。
 
 这不是固定的 PAE（Plan-Act-Execute）流水线；默认是 ReAct 循环。Plan Mode 是额外的可选权限模式，用于在行动前先提交计划并等待用户批准。
 
@@ -511,6 +512,9 @@ OpenAI-compatible provider 的 thinking mode 会保留 `reasoning_content` 并�
 - `text`：默认格式，连接远程模型时会流式输出文本
 - `json`：仍使用同一套 SSE/ReAct 循环，但 CLI 会缓冲完整响应后输出单个 JSON 对象
 - `stream-json`：通过 SSE 按真实增量输出 JSONL 事件；如果模型调用工具，会在工具结果返回后继续下一轮增量输出
+- `--max-turns <N>`：只在 `--print` 非交互模式下生效，用于限制 agentic turns；默认不限制
+- 交互模式默认不限制 turns，这一点与 Claude Code 的源码行为保持一致
+- 当 `--max-turns` 触发上限时，`text` 会输出 `Error: Reached max turns (N)` 并以退出码 `1` 结束；`json` 和 `stream-json` 会输出 `type=result`、`subtype=error_max_turns` 的错误对象
 
 ## 配置优先级
 
