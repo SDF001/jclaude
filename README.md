@@ -1,6 +1,6 @@
 # jclaude
 
-`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
+`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.1`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
 
 - `anthropic`：Anthropic Messages API 格式，调用 `/v1/messages`，支持 SSE 流式输出和 tool use。
 - `openai`：OpenAI-compatible Chat Completions 格式，调用 `/v1/chat/completions`，可用于 DeepSeek 等兼容 OpenAI API 的服务，支持 SSE 流式输出和 function tools。
@@ -14,8 +14,11 @@
 
 - `print` 模式和交互模式都支持远程模型 SSE 流式输出。
 - provider 使用 ReAct 型 agent loop：模型流式输出文本，遇到工具调用就执行本地工具，再把结果送回模型继续下一轮。
-- 支持 `Read` / `Write` / `Edit` / `Delete` 文件工具，其中 `Delete` 必须确认后才会真正删除。
+- 支持 `Read` / `Bash` / `Write` / `Edit` / `Delete` 工具，其中 `Delete` 必须确认后才会真正删除。
+- `Bash` 可执行编译、测试、启动服务等非交互命令，并返回 exit code、stdout 和 stderr。
 - 支持可选 Plan Mode：复杂或高风险任务可以先只读分析和制定计划，用户批准后再允许修改。
+- OpenAI-compatible provider 会保留并续传 DeepSeek 等模型返回的 `reasoning_content`，兼容 thinking mode 多轮工具调用。
+- 交互模式会显示 `思考中...`、工具开始和工具结果状态，避免多轮工具调用时文本挤在同一行。
 - 交互输入支持 `/` 命令补全、`@` 文件补全、光标左右移动、输入历史和长行横向滚动。
 - 支持本地 skills、图片输入、配置文件和 Anthropic/OpenAI-compatible provider。
 
@@ -28,7 +31,7 @@ mvn package
 构建完成后会生成：
 
 ```sh
-target/jclaude-0.1.0.jar
+target/jclaude-0.1.1.jar
 ```
 
 ## 启动项目
@@ -48,7 +51,7 @@ mvn package
 ### 方式二：直接运行 jar
 
 ```sh
-java -jar target/jclaude-0.1.0.jar --help
+java -jar target/jclaude-0.1.1.jar --help
 ```
 
 ## 基本用法
@@ -123,12 +126,22 @@ jclaude> 我刚才让你记住的词是什么？
 `jclaude` 会向模型提供类似 Claude Code 的本地文件工具：
 
 - `Read`：读取文本文件或列出目录；文本读取默认最多返回 2000 行，支持 `offset` / `limit` 按行读取
+- `Bash`：在当前工作目录执行非交互 shell 命令，返回 `exit_code`、`stdout` 和 `stderr`；默认超时 60 秒，最长 600 秒，输出会截断保护
 - `Write`：创建或完整覆盖文件
 - `Edit`：对已读文件做精确字符串替换
 - `Delete`：删除文件或目录，执行前必须由用户显式确认
-- `EnterPlanMode` / `ExitPlanMode`：可选计划模式；计划模式中禁止写入、编辑和删除，提交计划并获用户批准后才退出
+- `EnterPlanMode` / `ExitPlanMode`：可选计划模式；计划模式中禁止 `Bash`、写入、编辑和删除，提交计划并获用户批准后才退出
 
 这些工具由模型在 ReAct 循环中调用，不是用户直接输入的 shell 命令。只有工具结果明确成功时，模型才应该告知用户“已读取/写入/编辑/删除”；如果工具失败或用户拒绝确认，操作不会执行。
+
+`Bash` 适合让模型查看命令结果，例如：
+
+```text
+jclaude> 执行 mvn -q test，查看失败原因并修复
+jclaude> 启动 Spring Boot 项目，若端口冲突请修复并验证接口
+```
+
+长期运行的服务建议让模型使用后台命令并把日志写入文件，例如 `mvn spring-boot:run > /tmp/app.log 2>&1 &`，再用 `curl` 或读取日志验证结果。
 
 写入保护规则：
 
@@ -162,7 +175,7 @@ Plan Mode 是可选的只读计划模式，适合复杂或高风险任务：
 
 - 交互模式输入 `/plan` 可手动进入；`/plan status` 查看状态；`/plan off` 或 `/plan exit` 手动退出。
 - 模型也可以调用 `EnterPlanMode` 进入计划模式。
-- Plan Mode 中 `Write` / `Edit` / `Delete` 会被拒绝，只允许读取、分析和制定计划。
+- Plan Mode 中 `Bash` / `Write` / `Edit` / `Delete` 会被拒绝，只允许读取、分析和制定计划。
 - 模型调用 `ExitPlanMode` 时必须提交 `plan`，交互模式会展示计划并要求用户输入 `yes` 或 `确认`。
 - `-p` 非交互模式默认不会自动批准计划；自动化场景可设置 `JCLAUDE_AUTO_APPROVE_PLAN=true`。
 
@@ -475,6 +488,14 @@ JSON
 
 这不是固定的 PAE（Plan-Act-Execute）流水线；默认是 ReAct 循环。Plan Mode 是额外的可选权限模式，用于在行动前先提交计划并等待用户批准。
 
+交互模式会把模型思考和工具调用转换成简短状态行：
+
+- 收到 Anthropic `thinking_delta` 或 OpenAI-compatible `reasoning_content` 时显示 `思考中...`，但不会打印思考内容。
+- 工具开始执行时显示 `→ 工具名: 摘要`，例如 `→ Bash: mvn spring-boot:run`。
+- 工具结束后显示结果摘要，例如 `✓ Bash exit 0` 或 `✗ Bash exit 1`。
+
+OpenAI-compatible provider 的 thinking mode 会保留 `reasoning_content` 并在后续工具轮次回传给 API；这对 DeepSeek 等要求续传 reasoning 的模型是必需的。
+
 ## 输出格式
 
 支持三种输出格式：
@@ -549,6 +570,7 @@ JSON
 - `--input-format`、`--allowed-tools`、`--disallowed-tools`、`--mcp-config`、`--permission-mode`、`--settings`、`--agents` 当前只完成参数解析或 help 占位，尚未真正接入对应能力。
 - `mcp`、`plugin`、`auth/login/logout`、`install`、`update` 仍是占位实现；`completion` 当前只输出通用提示。
 - 暂未实现 MCP 工具、插件管理、工具 allowlist/denylist、权限模式矩阵和会话持久化。
+- `Bash` 是非交互命令执行工具，不适合需要持续前台交互输入的程序；长时间运行的服务应后台启动并写日志。
 - 工具循环有最大轮次保护，超过后会中止并报错，避免模型无限调用工具。
 - 图片会作为本地文件内容发送给 provider，但最终识别效果取决于所选模型是否支持视觉输入。
 - OpenAI-compatible provider 的 WebP 图片会依赖本机 `sips` 命令临时转换为 PNG；非 macOS 环境如缺少 `sips`，请先手动转换为 PNG/JPEG。

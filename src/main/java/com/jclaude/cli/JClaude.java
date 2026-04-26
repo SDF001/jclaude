@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.Console;
 import java.io.IOException;
 import java.io.InputStream;
@@ -30,13 +31,14 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 public final class JClaude {
-    private static final String VERSION = "0.1.0";
+    private static final String VERSION = "0.1.1";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
@@ -52,6 +54,9 @@ public final class JClaude {
     private static final int MAX_TOOL_TURNS = 20;
     private static final int MAX_TOOL_READ_LINES = 2_000;
     private static final long MAX_TOOL_TEXT_FILE_BYTES = 2_000_000L;
+    private static final int DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
+    private static final int MAX_COMMAND_TIMEOUT_SECONDS = 600;
+    private static final int MAX_COMMAND_OUTPUT_BYTES = 200_000;
     private static final Pattern AT_FILE_REFERENCE_PATTERN = Pattern.compile("(^|\\s)@(?:\"([^\"]+)\"|([^\\s]+))");
     private static final Pattern AT_FILE_LINE_RANGE_PATTERN = Pattern.compile("^([^#]+)(?:#L(\\d+)(?:-(\\d+))?)?(?:#[^#]*)?$");
 
@@ -138,7 +143,7 @@ public final class JClaude {
                     config,
                     agentSession,
                     false,
-                    chunk -> System.out.println(toJson(Map.of("type", "content_block_delta", "text", chunk)))
+                    (Consumer<String>) chunk -> System.out.println(toJson(Map.of("type", "content_block_delta", "text", chunk)))
             );
             System.out.println(toJson(Map.of("type", "message_stop")));
         } else if ("text".equals(outputFormat)) {
@@ -147,7 +152,7 @@ public final class JClaude {
                     config,
                     agentSession,
                     false,
-                    chunk -> {
+                    (Consumer<String>) chunk -> {
                         System.out.print(chunk);
                         System.out.flush();
                     }
@@ -193,17 +198,15 @@ public final class JClaude {
                     System.out.println("Running skill: " + invocation.get().skill().name());
                     List<ChatMessage> nextMessages = new ArrayList<>(history);
                     nextMessages.add(new ChatMessage("user", invocation.get().expandedPrompt()));
+                    InteractiveStreamingObserver observer = new InteractiveStreamingObserver();
                     String response = responseForStreaming(
                             nextMessages,
                             config,
                             agentSession,
                             true,
-                            chunk -> {
-                                System.out.print(chunk);
-                                System.out.flush();
-                            }
+                            observer
                     );
-                    System.out.println();
+                    observer.finish();
                     history.clear();
                     history.addAll(nextMessages);
                     history.add(new ChatMessage("assistant", response));
@@ -211,17 +214,15 @@ public final class JClaude {
                 }
                 List<ChatMessage> nextMessages = new ArrayList<>(history);
                 nextMessages.add(promptInput.toChatMessage());
+                InteractiveStreamingObserver observer = new InteractiveStreamingObserver();
                 String response = responseForStreaming(
                         nextMessages,
                         config,
                         agentSession,
                         true,
-                        chunk -> {
-                            System.out.print(chunk);
-                            System.out.flush();
-                        }
+                        observer
                 );
-                System.out.println();
+                observer.finish();
                 history.clear();
                 history.addAll(nextMessages);
                 history.add(new ChatMessage("assistant", response));
@@ -472,14 +473,18 @@ public final class JClaude {
 
     private String responseFor(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation) throws IOException {
         StringBuilder response = new StringBuilder();
-        responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, response::append);
+        responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, (Consumer<String>) response::append);
         return response.toString();
     }
 
     private String responseForStreaming(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation, Consumer<String> onText) throws IOException {
+        return responseForStreaming(messages, config, agentSession, allowDestructiveConfirmation, StreamingObserver.forText(onText));
+    }
+
+    private String responseForStreaming(List<ChatMessage> messages, EffectiveConfig config, AgentSession agentSession, boolean allowDestructiveConfirmation, StreamingObserver observer) throws IOException {
         if (config.apiKey().isEmpty()) {
             String response = localResponse(messages.getLast(), config.provider(), config.skills());
-            onText.accept(response);
+            observer.onText(response);
             return response;
         }
         return switch (config.provider()) {
@@ -491,7 +496,7 @@ public final class JClaude {
                     config.skills(),
                     agentSession,
                     allowDestructiveConfirmation,
-                    onText
+                    observer
             );
             case OPENAI -> openAiStreamingToolLoop(
                     messages,
@@ -501,7 +506,7 @@ public final class JClaude {
                     config.skills(),
                     agentSession,
                     allowDestructiveConfirmation,
-                    onText
+                    observer
             );
         };
     }
@@ -525,13 +530,15 @@ public final class JClaude {
                 # 本地文件系统
                 你正在 jclaude CLI 中运行。当前工作目录：%s
 
-                你可以用 Read、Write、Edit、Delete 工具检查和修改本地文件，并可用 EnterPlanMode / ExitPlanMode 管理计划模式。
+                你可以用 Read、Bash、Write、Edit、Delete 工具检查、运行命令和修改本地文件，并可用 EnterPlanMode / ExitPlanMode 管理计划模式。
                 当用户提到 @path 时，将其视为本地文件引用；相对路径从当前工作目录解析。
                 优先用 Read 查看文件，用 Edit 做定点修改，只有创建新文件或完整重写时才用 Write。
                 修改已有文件前必须先读取文件，确保掌握最新内容。
-                删除文件必须使用 Delete 工具；不要用文字声称删除，也不要用 Write/Edit 伪造删除。
+                删除文件必须使用 Delete 工具；不要用文字声称删除，也不要用 Write/Edit 或 Bash 伪造删除。
+                需要编译、测试、启动服务或查看命令结果时，使用 Bash；Bash 返回 exit code、stdout 和 stderr。长期运行的服务应后台启动并把日志写入文件，或设置合理超时只捕获启动报错。
                 只有当工具结果明确成功时，才能告诉用户文件已读取、写入、修改或删除。如果工具返回错误或用户拒绝确认，必须明确说明操作没有执行。
                 Delete 是破坏性操作，jclaude 会在执行前请求用户显式确认。
+                在 Plan Mode 中 Bash/Write/Edit/Delete 会被拒绝。
                 """.formatted(agentSession.modeLabel(), cwd);
         String skillPrompt = skills.systemPrompt();
         if (skillPrompt.isBlank()) {
@@ -548,7 +555,7 @@ public final class JClaude {
             SkillRegistry skills,
             AgentSession agentSession,
             boolean allowDestructiveConfirmation,
-            Consumer<String> onText
+            StreamingObserver observer
     ) throws IOException {
         List<Map<String, Object>> payloadMessages = new ArrayList<>(anthropicMessagePayload(messages));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
@@ -576,7 +583,7 @@ public final class JClaude {
                             "x-api-key", apiKey,
                             "anthropic-version", "2023-06-01"
                     ),
-                    onText
+                    observer
             );
             fullResponse.append(streamingTurn.text());
             if (streamingTurn.toolCalls().isEmpty()) {
@@ -589,10 +596,13 @@ public final class JClaude {
             ));
             List<Map<String, Object>> toolResults = new ArrayList<>();
             for (ToolCall toolCall : streamingTurn.toolCalls()) {
+                observer.onToolStart(toolCall);
+                String result = toolSession.execute(toolCall.name(), toolCall.input());
+                observer.onToolEnd(toolCall, result);
                 toolResults.add(Map.of(
                         "type", "tool_result",
                         "tool_use_id", toolCall.id(),
-                        "content", toolSession.execute(toolCall.name(), toolCall.input())
+                        "content", result
                 ));
             }
             payloadMessages.add(Map.of("role", "user", "content", toolResults));
@@ -604,7 +614,7 @@ public final class JClaude {
             String url,
             Map<String, Object> body,
             Map<String, String> headers,
-            Consumer<String> onText
+            StreamingObserver observer
     ) throws IOException {
         StringBuilder text = new StringBuilder();
         Map<Integer, Map<String, Object>> contentBlocks = new TreeMap<>();
@@ -643,13 +653,19 @@ public final class JClaude {
                         if (!chunk.isEmpty()) {
                             block.put("text", block.getOrDefault("text", "") + chunk);
                             text.append(chunk);
-                            onText.accept(chunk);
+                            observer.onText(chunk);
                         }
                     }
                     case "input_json_delta" -> toolInputBuffers
                             .computeIfAbsent(index, ignored -> new StringBuilder())
                             .append(delta.path("partial_json").asText(""));
-                    case "thinking_delta" -> block.put("thinking", block.getOrDefault("thinking", "") + delta.path("thinking").asText(""));
+                    case "thinking_delta" -> {
+                        String chunk = delta.path("thinking").asText("");
+                        block.put("thinking", block.getOrDefault("thinking", "") + chunk);
+                        if (!chunk.isEmpty()) {
+                            observer.onReasoningDelta(chunk);
+                        }
+                    }
                     case "signature_delta" -> block.put("signature", delta.path("signature").asText(""));
                     default -> {
                     }
@@ -686,7 +702,7 @@ public final class JClaude {
             SkillRegistry skills,
             AgentSession agentSession,
             boolean allowDestructiveConfirmation,
-            Consumer<String> onText
+            StreamingObserver observer
     ) throws IOException {
         List<Map<String, Object>> payloadMessages = new ArrayList<>(openAiMessagePayload(messages, systemPrompt(skills, agentSession)));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
@@ -705,7 +721,7 @@ public final class JClaude {
                     apiUrl(baseUrl, "/v1/chat/completions"),
                     body,
                     Map.of("Authorization", "Bearer " + apiKey),
-                    onText
+                    observer
             );
             fullResponse.append(streamingTurn.text());
             if (streamingTurn.toolCalls().isEmpty()) {
@@ -714,10 +730,13 @@ public final class JClaude {
 
             payloadMessages.add(streamingTurn.assistantMessage());
             for (ToolCall toolCall : streamingTurn.toolCalls()) {
+                observer.onToolStart(toolCall);
+                String result = toolSession.execute(toolCall.name(), toolCall.input());
+                observer.onToolEnd(toolCall, result);
                 Map<String, Object> toolMessage = new LinkedHashMap<>();
                 toolMessage.put("role", "tool");
                 toolMessage.put("tool_call_id", toolCall.id());
-                toolMessage.put("content", toolSession.execute(toolCall.name(), toolCall.input()));
+                toolMessage.put("content", result);
                 payloadMessages.add(toolMessage);
             }
         }
@@ -728,20 +747,29 @@ public final class JClaude {
             String url,
             Map<String, Object> body,
             Map<String, String> headers,
-            Consumer<String> onText
+            StreamingObserver observer
     ) throws IOException {
         StringBuilder text = new StringBuilder();
+        StringBuilder reasoningContent = new StringBuilder();
         Map<Integer, OpenAiToolCallBuilder> toolBuilders = new TreeMap<>();
 
         sendSseJsonEvents(url, body, headers, json -> {
             JsonNode choice = json.path("choices").path(0);
             JsonNode delta = choice.path("delta");
+            JsonNode reasoningContentDelta = delta.path("reasoning_content");
+            if (reasoningContentDelta.isTextual()) {
+                String chunk = reasoningContentDelta.asText();
+                reasoningContent.append(chunk);
+                if (!chunk.isEmpty()) {
+                    observer.onReasoningDelta(chunk);
+                }
+            }
             JsonNode content = delta.path("content");
             if (content.isTextual()) {
                 String chunk = content.asText();
                 if (!chunk.isEmpty()) {
                     text.append(chunk);
-                    onText.accept(chunk);
+                    observer.onText(chunk);
                 }
             }
             JsonNode toolCalls = delta.path("tool_calls");
@@ -786,6 +814,9 @@ public final class JClaude {
         Map<String, Object> assistantMessage = new LinkedHashMap<>();
         assistantMessage.put("role", "assistant");
         assistantMessage.put("content", text.isEmpty() ? null : text.toString());
+        if (!reasoningContent.isEmpty()) {
+            assistantMessage.put("reasoning_content", reasoningContent.toString());
+        }
         if (!assistantToolCalls.isEmpty()) {
             assistantMessage.put("tool_calls", assistantToolCalls);
         }
@@ -804,6 +835,16 @@ public final class JClaude {
                                 "offset", schemaProperty("integer", "从第几行开始读取，1 为第一行"),
                                 "limit", schemaProperty("integer", "最多读取多少行")
                         ), List.of("file_path"))
+                ),
+                Map.of(
+                        "name", "Bash",
+                        "description", """
+                                在当前工作目录执行非交互 shell 命令，并返回 exit_code、stdout 和 stderr。适合编译、测试、查看命令结果或排查启动报错。不要执行需要交互输入的命令；长期运行的服务应后台启动并把日志写入文件，或设置 timeout_seconds 只捕获启动输出。默认超时 60 秒，最长 600 秒。
+                                """,
+                        "input_schema", objectSchema(Map.of(
+                                "command", schemaProperty("string", "要执行的 shell 命令"),
+                                "timeout_seconds", schemaProperty("integer", "超时秒数，默认 60，最大 600")
+                        ), List.of("command"))
                 ),
                 Map.of(
                         "name", "Write",
@@ -840,7 +881,7 @@ public final class JClaude {
                 Map.of(
                         "name", "EnterPlanMode",
                         "description", """
-                                进入 Plan Mode。用于复杂或高风险任务的只读探索和实施计划制定。进入后 Write/Edit/Delete 会被拒绝，直到 ExitPlanMode 的计划获得用户批准。
+                                进入 Plan Mode。用于复杂或高风险任务的只读探索和实施计划制定。进入后 Bash/Write/Edit/Delete 会被拒绝，直到 ExitPlanMode 的计划获得用户批准。
                                 """,
                         "input_schema", objectSchema(Map.of(), List.of())
                 ),
@@ -1000,6 +1041,28 @@ public final class JClaude {
             return true;
         }
         return handler.handle(JSON.readTree(data));
+    }
+
+    private interface StreamingObserver {
+        void onText(String chunk);
+
+        default void onReasoningDelta(String chunk) {
+        }
+
+        default void onToolStart(ToolCall toolCall) {
+        }
+
+        default void onToolEnd(ToolCall toolCall, String result) {
+        }
+
+        static StreamingObserver forText(Consumer<String> onText) {
+            return new StreamingObserver() {
+                @Override
+                public void onText(String chunk) {
+                    onText.accept(chunk);
+                }
+            };
+        }
     }
 
     private interface StreamingEventHandler {
@@ -1292,6 +1355,124 @@ public final class JClaude {
                 || filename.endsWith(".webp");
     }
 
+    private static List<String> shellCommand(String command) {
+        if (System.getProperty("os.name", "").toLowerCase().contains("win")) {
+            return List.of("cmd.exe", "/c", command);
+        }
+        return List.of(firstNonBlank(System.getenv("SHELL"), "/bin/sh"), "-lc", command);
+    }
+
+    private static void terminateProcess(Process process) throws InterruptedException {
+        process.descendants().forEach(ProcessHandle::destroy);
+        process.destroy();
+        if (!process.waitFor(2, TimeUnit.SECONDS)) {
+            process.descendants().forEach(ProcessHandle::destroyForcibly);
+            process.destroyForcibly();
+            process.waitFor(2, TimeUnit.SECONDS);
+        }
+    }
+
+    private static void finishOutputCollector(ProcessOutputCollector collector) throws InterruptedException {
+        if (!collector.awaitCompletion(1_000)) {
+            collector.close();
+            collector.awaitCompletion(1_000);
+        }
+    }
+
+    private static String formatCommandResult(
+            String command,
+            Path cwd,
+            int timeoutSeconds,
+            boolean timedOut,
+            int exitCode,
+            CapturedOutput stdout,
+            CapturedOutput stderr
+    ) {
+        StringBuilder builder = new StringBuilder();
+        builder.append("<command_result>").append(System.lineSeparator());
+        builder.append("<command>").append(escapeXml(command)).append("</command>").append(System.lineSeparator());
+        builder.append("<cwd>").append(escapeXml(cwd.toString())).append("</cwd>").append(System.lineSeparator());
+        builder.append("<timeout_seconds>").append(timeoutSeconds).append("</timeout_seconds>").append(System.lineSeparator());
+        builder.append("<timed_out>").append(timedOut).append("</timed_out>").append(System.lineSeparator());
+        builder.append("<exit_code>").append(exitCode).append("</exit_code>").append(System.lineSeparator());
+        appendCapturedOutput(builder, "stdout", stdout);
+        appendCapturedOutput(builder, "stderr", stderr);
+        builder.append("</command_result>");
+        return builder.toString();
+    }
+
+    private static void appendCapturedOutput(StringBuilder builder, String name, CapturedOutput output) {
+        builder.append("<")
+                .append(name)
+                .append(" truncated=\"")
+                .append(output.truncated())
+                .append("\" bytes=\"")
+                .append(output.bytesRead())
+                .append("\">")
+                .append(System.lineSeparator())
+                .append(escapeXml(output.text()))
+                .append(System.lineSeparator())
+                .append("</")
+                .append(name)
+                .append(">")
+                .append(System.lineSeparator());
+    }
+
+    private static String toolStartSummary(ToolCall toolCall) {
+        JsonNode input = toolCall.input();
+        return switch (toolCall.name()) {
+            case "Bash" -> "Bash: " + abbreviate(oneLine(input.path("command").asText("")), 140);
+            case "Read" -> "Read: " + abbreviate(input.path("file_path").asText(""), 120);
+            case "Write" -> "Write: " + abbreviate(input.path("file_path").asText(""), 120);
+            case "Edit" -> "Edit: " + abbreviate(input.path("file_path").asText(""), 120);
+            case "Delete" -> "Delete: " + abbreviate(input.path("file_path").asText(""), 120);
+            case "EnterPlanMode" -> "EnterPlanMode";
+            case "ExitPlanMode" -> "ExitPlanMode";
+            default -> toolCall.name().isBlank() ? "Tool" : toolCall.name();
+        };
+    }
+
+    private static String toolEndSummary(ToolCall toolCall, String result) {
+        boolean error = result.contains("<tool_use_error>");
+        if ("Bash".equals(toolCall.name())) {
+            String exitCode = tagValue(result, "exit_code").orElse(error ? "error" : "?");
+            return (error || !"0".equals(exitCode) ? "✗ " : "✓ ") + "Bash exit " + exitCode;
+        }
+        return (error ? "✗ " : "✓ ") + (toolCall.name().isBlank() ? "Tool" : toolCall.name());
+    }
+
+    private static Optional<String> tagValue(String value, String tagName) {
+        String startTag = "<" + tagName + ">";
+        String endTag = "</" + tagName + ">";
+        int start = value.indexOf(startTag);
+        if (start < 0) {
+            return Optional.empty();
+        }
+        int valueStart = start + startTag.length();
+        int end = value.indexOf(endTag, valueStart);
+        if (end < 0) {
+            return Optional.empty();
+        }
+        return Optional.of(value.substring(valueStart, end).trim());
+    }
+
+    private static String oneLine(String value) {
+        return value.replace('\n', ' ')
+                .replace('\r', ' ')
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    private static String abbreviate(String value, int maxChars) {
+        if (value.length() <= maxChars) {
+            return value;
+        }
+        if (maxChars <= 1) {
+            return "…";
+        }
+        return value.substring(0, maxChars - 1) + "…";
+    }
+
     private record ToolCall(String id, String name, JsonNode input) {
     }
 
@@ -1308,6 +1489,138 @@ public final class JClaude {
     }
 
     private record ReadState(String content, long timestamp, boolean partialView) {
+    }
+
+    private record CapturedOutput(String text, boolean truncated, long bytesRead) {
+    }
+
+    private static final class InteractiveStreamingObserver implements StreamingObserver {
+        private boolean lineStart = true;
+        private boolean statusActive;
+        private boolean sawOutput;
+
+        @Override
+        public void onText(String chunk) {
+            if (chunk == null || chunk.isEmpty()) {
+                return;
+            }
+            clearStatus();
+            System.out.print(chunk);
+            System.out.flush();
+            sawOutput = true;
+            lineStart = chunk.endsWith("\n") || chunk.endsWith("\r");
+        }
+
+        @Override
+        public void onReasoningDelta(String chunk) {
+            if (chunk == null || chunk.isEmpty() || statusActive) {
+                return;
+            }
+            if (!lineStart) {
+                System.out.println();
+            }
+            System.out.print("思考中...");
+            System.out.flush();
+            statusActive = true;
+            sawOutput = true;
+            lineStart = false;
+        }
+
+        @Override
+        public void onToolStart(ToolCall toolCall) {
+            clearStatus();
+            if (!lineStart) {
+                System.out.println();
+            }
+            System.out.println("→ " + toolStartSummary(toolCall));
+            System.out.flush();
+            sawOutput = true;
+            lineStart = true;
+        }
+
+        @Override
+        public void onToolEnd(ToolCall toolCall, String result) {
+            clearStatus();
+            System.out.println(toolEndSummary(toolCall, result));
+            System.out.flush();
+            sawOutput = true;
+            lineStart = true;
+        }
+
+        void finish() {
+            clearStatus();
+            if (!lineStart || !sawOutput) {
+                System.out.println();
+                System.out.flush();
+                lineStart = true;
+            }
+        }
+
+        private void clearStatus() {
+            if (!statusActive) {
+                return;
+            }
+            System.out.print("\r\033[2K");
+            System.out.flush();
+            statusActive = false;
+            lineStart = true;
+        }
+    }
+
+    private static final class ProcessOutputCollector {
+        private final InputStream stream;
+        private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        private final Thread thread;
+        private long bytesRead;
+        private boolean truncated;
+
+        ProcessOutputCollector(InputStream stream, String name) {
+            this.stream = stream;
+            this.thread = new Thread(this::readLoop, "jclaude-" + name + "-collector");
+            this.thread.setDaemon(true);
+            this.thread.start();
+        }
+
+        boolean awaitCompletion(long millis) throws InterruptedException {
+            thread.join(millis);
+            return !thread.isAlive();
+        }
+
+        void close() {
+            try {
+                stream.close();
+            } catch (IOException ignored) {
+            }
+        }
+
+        synchronized CapturedOutput snapshot() {
+            return new CapturedOutput(buffer.toString(StandardCharsets.UTF_8), truncated, bytesRead);
+        }
+
+        private void readLoop() {
+            byte[] chunk = new byte[8192];
+            try (InputStream input = stream) {
+                int read;
+                while ((read = input.read(chunk)) >= 0) {
+                    append(chunk, read);
+                }
+            } catch (IOException ignored) {
+            }
+        }
+
+        private synchronized void append(byte[] chunk, int read) {
+            bytesRead += read;
+            int remaining = MAX_COMMAND_OUTPUT_BYTES - buffer.size();
+            if (remaining <= 0) {
+                truncated = true;
+                return;
+            }
+            int bytesToKeep = Math.min(read, remaining);
+            buffer.write(chunk, 0, bytesToKeep);
+            if (bytesToKeep < read) {
+                truncated = true;
+            }
+        }
     }
 
     private static final class AgentSession {
@@ -1385,6 +1698,10 @@ public final class JClaude {
                 }
                 return switch (name) {
                     case "Read" -> read(input);
+                    case "Bash" -> {
+                        requireNotPlanMode("Bash");
+                        yield bash(input);
+                    }
                     case "Write" -> {
                         requireNotPlanMode("Write");
                         yield write(input);
@@ -1410,7 +1727,7 @@ public final class JClaude {
             agentSession.enterPlanMode();
             return """
                     已进入 Plan Mode。
-                    现在应只进行读取、分析和计划制定；Write/Edit/Delete 会被拒绝。
+                    现在应只进行读取、分析和计划制定；Bash/Write/Edit/Delete 会被拒绝。
                     完成计划后调用 ExitPlanMode，并在 plan 参数中提交计划等待用户批准。
                     """;
         }
@@ -1496,6 +1813,55 @@ public final class JClaude {
                 }
             }
             return result.toString();
+        }
+
+        private String bash(JsonNode input) throws IOException {
+            String command = requiredText(input, "command").trim();
+            if (command.isBlank()) {
+                throw new CliException("command 不能为空。");
+            }
+            int timeoutSeconds = optionalPositiveInt(input, "timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS);
+            if (timeoutSeconds > MAX_COMMAND_TIMEOUT_SECONDS) {
+                throw new CliException("timeout_seconds 不能超过 " + MAX_COMMAND_TIMEOUT_SECONDS + "。");
+            }
+
+            Path cwd = Path.of("").toAbsolutePath().normalize();
+            ProcessBuilder builder = new ProcessBuilder(shellCommand(command));
+            builder.directory(cwd.toFile());
+            builder.environment().putIfAbsent("NO_COLOR", "1");
+            Process process = builder.start();
+            ProcessOutputCollector stdout = new ProcessOutputCollector(process.getInputStream(), "stdout");
+            ProcessOutputCollector stderr = new ProcessOutputCollector(process.getErrorStream(), "stderr");
+
+            boolean timedOut = false;
+            int exitCode;
+            try {
+                if (process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                    exitCode = process.exitValue();
+                } else {
+                    timedOut = true;
+                    terminateProcess(process);
+                    exitCode = 124;
+                }
+                finishOutputCollector(stdout);
+                finishOutputCollector(stderr);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                process.destroyForcibly();
+                stdout.close();
+                stderr.close();
+                throw new CliException("命令执行被中断：" + command);
+            }
+
+            return formatCommandResult(
+                    command,
+                    cwd,
+                    timeoutSeconds,
+                    timedOut,
+                    exitCode,
+                    stdout.snapshot(),
+                    stderr.snapshot()
+            );
         }
 
         private String write(JsonNode input) throws IOException {
