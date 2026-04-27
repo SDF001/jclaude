@@ -38,7 +38,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 public final class JClaude {
-    private static final String VERSION = "0.1.3";
+    private static final String VERSION = "0.1.4";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
@@ -59,9 +59,15 @@ public final class JClaude {
     private static final int STREAMING_REQUEST_COMPACT_TRIGGER_BYTES = 140_000;
     private static final int STREAMING_REQUEST_COMPACT_TARGET_BYTES = 110_000;
     private static final int COMPACTED_TOOL_RESULT_PREVIEW_CHARS = 8_000;
+    private static final int MAX_OUTPUT_RECOVERY_ATTEMPTS = 2;
     private static final String COMPACTED_TOOL_RESULT_NOTICE = """
             <system-reminder>较早的工具结果已被 jclaude 压缩以控制请求大小。
             如果后续确实需要完整内容，请再次调用对应工具重新读取或执行。</system-reminder>
+            """;
+    private static final String OUTPUT_LIMIT_RECOVERY_PROMPT = """
+            Output token limit hit. Resume directly from where you left off.
+            Do not apologize. Do not restart from the beginning.
+            Continue the unfinished work in smaller chunks and keep going.
             """;
     private static final Pattern AT_FILE_REFERENCE_PATTERN = Pattern.compile("(^|\\s)@(?:\"([^\"]+)\"|([^\\s]+))");
     private static final Pattern AT_FILE_LINE_RANGE_PATTERN = Pattern.compile("^([^#]+)(?:#L(\\d+)(?:-(\\d+))?)?(?:#[^#]*)?$");
@@ -649,6 +655,7 @@ public final class JClaude {
         List<Map<String, Object>> payloadMessages = new ArrayList<>(anthropicMessagePayload(messages));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
         StringBuilder fullResponse = new StringBuilder();
+        int outputRecoveryAttempts = 0;
         for (int turn = 0; maxToolTurns == null || turn < maxToolTurns; turn++) {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
@@ -677,8 +684,25 @@ public final class JClaude {
             );
             fullResponse.append(streamingTurn.text());
             if (streamingTurn.toolCalls().isEmpty()) {
+                if (stopReasonReachedOutputLimit(streamingTurn.stopReason()) && outputRecoveryAttempts < MAX_OUTPUT_RECOVERY_ATTEMPTS) {
+                    payloadMessages.add(Map.of(
+                            "role", "assistant",
+                            "content", anthropicAssistantContentForResume(streamingTurn)
+                    ));
+                    payloadMessages.add(Map.of(
+                            "role", "user",
+                            "content", OUTPUT_LIMIT_RECOVERY_PROMPT
+                    ));
+                    outputRecoveryAttempts++;
+                    continue;
+                }
+                if (streamingTurn.text().isBlank()) {
+                    throw new CliException("Provider returned an empty assistant turn"
+                            + formatStopReasonSuffix(streamingTurn.stopReason()) + ".");
+                }
                 return fullResponse.toString();
             }
+            outputRecoveryAttempts = 0;
 
             payloadMessages.add(Map.of(
                     "role", "assistant",
@@ -710,6 +734,7 @@ public final class JClaude {
         Map<Integer, Map<String, Object>> contentBlocks = new TreeMap<>();
         Map<Integer, StringBuilder> toolInputBuffers = new LinkedHashMap<>();
         List<ToolCall> toolCalls = new ArrayList<>();
+        String[] stopReason = new String[1];
 
         sendSseJsonEvents(url, body, headers, json -> {
             String type = json.path("type").asText();
@@ -762,6 +787,13 @@ public final class JClaude {
                 }
                 return false;
             }
+            if ("message_delta".equals(type)) {
+                JsonNode delta = json.path("delta");
+                if (delta.path("stop_reason").isTextual()) {
+                    stopReason[0] = delta.path("stop_reason").asText();
+                }
+                return false;
+            }
             if ("content_block_stop".equals(type)) {
                 int index = json.path("index").asInt();
                 Map<String, Object> block = contentBlocks.get(index);
@@ -781,7 +813,7 @@ public final class JClaude {
             return false;
         });
 
-        return new StreamingAnthropicTurn(text.toString(), new ArrayList<>(contentBlocks.values()), List.copyOf(toolCalls));
+        return new StreamingAnthropicTurn(text.toString(), new ArrayList<>(contentBlocks.values()), List.copyOf(toolCalls), stopReason[0]);
     }
 
     private String openAiStreamingToolLoop(
@@ -798,6 +830,7 @@ public final class JClaude {
         List<Map<String, Object>> payloadMessages = new ArrayList<>(openAiMessagePayload(messages, systemPrompt(skills, agentSession)));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
         StringBuilder fullResponse = new StringBuilder();
+        int outputRecoveryAttempts = 0;
         for (int turn = 0; maxToolTurns == null || turn < maxToolTurns; turn++) {
             if (turn > 0 && !payloadMessages.isEmpty() && "system".equals(payloadMessages.getFirst().get("role"))) {
                 payloadMessages.set(0, Map.of("role", "system", "content", systemPrompt(skills, agentSession)));
@@ -817,8 +850,22 @@ public final class JClaude {
             );
             fullResponse.append(streamingTurn.text());
             if (streamingTurn.toolCalls().isEmpty()) {
+                if (stopReasonReachedOutputLimit(streamingTurn.stopReason()) && outputRecoveryAttempts < MAX_OUTPUT_RECOVERY_ATTEMPTS) {
+                    payloadMessages.add(openAiAssistantMessageForResume(streamingTurn));
+                    payloadMessages.add(Map.of(
+                            "role", "user",
+                            "content", OUTPUT_LIMIT_RECOVERY_PROMPT
+                    ));
+                    outputRecoveryAttempts++;
+                    continue;
+                }
+                if (streamingTurn.text().isBlank()) {
+                    throw new CliException("Provider returned an empty assistant turn"
+                            + formatStopReasonSuffix(streamingTurn.stopReason()) + ".");
+                }
                 return fullResponse.toString();
             }
+            outputRecoveryAttempts = 0;
 
             payloadMessages.add(streamingTurn.assistantMessage());
             for (ToolCall toolCall : streamingTurn.toolCalls()) {
@@ -844,9 +891,13 @@ public final class JClaude {
         StringBuilder text = new StringBuilder();
         StringBuilder reasoningContent = new StringBuilder();
         Map<Integer, OpenAiToolCallBuilder> toolBuilders = new TreeMap<>();
+        String[] stopReason = new String[1];
 
         sendSseJsonEvents(url, body, headers, json -> {
             JsonNode choice = json.path("choices").path(0);
+            if (choice.path("finish_reason").isTextual()) {
+                stopReason[0] = choice.path("finish_reason").asText();
+            }
             JsonNode delta = choice.path("delta");
             JsonNode reasoningContentDelta = delta.path("reasoning_content");
             if (reasoningContentDelta.isTextual()) {
@@ -912,7 +963,7 @@ public final class JClaude {
         if (!assistantToolCalls.isEmpty()) {
             assistantMessage.put("tool_calls", assistantToolCalls);
         }
-        return new StreamingOpenAiTurn(text.toString(), assistantMessage, List.copyOf(toolCalls));
+        return new StreamingOpenAiTurn(text.toString(), assistantMessage, List.copyOf(toolCalls), stopReason[0]);
     }
 
     private List<Map<String, Object>> anthropicToolDefinitions() {
@@ -1255,6 +1306,22 @@ public final class JClaude {
         return result;
     }
 
+    private List<Map<String, Object>> anthropicAssistantContentForResume(StreamingAnthropicTurn turn) {
+        if (!turn.contentBlocks().isEmpty()) {
+            return turn.contentBlocks();
+        }
+        return List.of(Map.of("type", "text", "text", "[Output interrupted]"));
+    }
+
+    private Map<String, Object> openAiAssistantMessageForResume(StreamingOpenAiTurn turn) {
+        Map<String, Object> assistantMessage = new LinkedHashMap<>(turn.assistantMessage());
+        Object content = assistantMessage.get("content");
+        if (content == null || String.valueOf(content).isBlank()) {
+            assistantMessage.put("content", "[Output interrupted]");
+        }
+        return assistantMessage;
+    }
+
     private String compactToolResultText(String text, boolean aggressive) {
         if (text == null || text.isBlank()) {
             return text;
@@ -1279,6 +1346,17 @@ public final class JClaude {
     private boolean looksLikeClosedStream(IOException exception) {
         String message = exception.getMessage();
         return message != null && "closed".equalsIgnoreCase(message.trim());
+    }
+
+    private boolean stopReasonReachedOutputLimit(String stopReason) {
+        if (stopReason == null) {
+            return false;
+        }
+        return "max_tokens".equalsIgnoreCase(stopReason) || "length".equalsIgnoreCase(stopReason);
+    }
+
+    private String formatStopReasonSuffix(String stopReason) {
+        return stopReason == null || stopReason.isBlank() ? "" : " (stop_reason=" + stopReason + ")";
     }
 
     private String formatKiB(int bytes) {
@@ -1762,10 +1840,10 @@ public final class JClaude {
     private record ToolCall(String id, String name, JsonNode input) {
     }
 
-    private record StreamingAnthropicTurn(String text, List<Map<String, Object>> contentBlocks, List<ToolCall> toolCalls) {
+    private record StreamingAnthropicTurn(String text, List<Map<String, Object>> contentBlocks, List<ToolCall> toolCalls, String stopReason) {
     }
 
-    private record StreamingOpenAiTurn(String text, Map<String, Object> assistantMessage, List<ToolCall> toolCalls) {
+    private record StreamingOpenAiTurn(String text, Map<String, Object> assistantMessage, List<ToolCall> toolCalls, String stopReason) {
     }
 
     private static final class OpenAiToolCallBuilder {

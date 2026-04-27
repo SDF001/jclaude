@@ -1,6 +1,6 @@
 # jclaude
 
-`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.3`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
+`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.4`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
 
 - `anthropic`：Anthropic Messages API 格式，调用 `/v1/messages`，支持 SSE 流式输出和 tool use。
 - `openai`：OpenAI-compatible Chat Completions 格式，调用 `/v1/chat/completions`，可用于 DeepSeek 等兼容 OpenAI API 的服务，支持 SSE 流式输出和 function tools。
@@ -21,6 +21,8 @@
 - 交互模式会显示 `思考中...`、工具开始和工具结果状态，避免多轮工具调用时文本挤在同一行。
 - 交互模式中，单轮 provider/SSE 异常只会结束当前轮并保留 REPL，不会因为一次 `closed`/断流直接退出整个 CLI。
 - 在多轮工具调用请求过大时，会自动压缩较早的工具结果与中间说明，降低长任务触发上游断流的概率。
+- 当 provider 因输出长度提前截断响应时，`jclaude` 会自动追加一轮恢复提示，让模型从中断处继续，而不是静默结束任务。
+- 如果 provider 返回空白 assistant 结束轮次，`jclaude` 会显式报错并保留会话，避免看起来“执行成功但什么都没生成”。
 - `-p` 非交互模式支持 `--max-turns <N>` 限制 agentic turns；交互模式默认不限制。
 - 交互输入支持 `/` 命令补全、`@` 文件补全、光标左右移动、输入历史和长行横向滚动。
 - 支持本地 skills、图片输入、配置文件和 Anthropic/OpenAI-compatible provider。
@@ -34,7 +36,7 @@ mvn package
 构建完成后会生成：
 
 ```sh
-target/jclaude-0.1.3.jar
+target/jclaude-0.1.4.jar
 ```
 
 ## 启动项目
@@ -54,7 +56,7 @@ mvn package
 ### 方式二：直接运行 jar
 
 ```sh
-java -jar target/jclaude-0.1.3.jar --help
+java -jar target/jclaude-0.1.4.jar --help
 ```
 
 ## 基本用法
@@ -113,6 +115,8 @@ jclaude> 我刚才让你记住的词是什么？
 注意：当前多轮记忆只保存在本次 `./bin/jclaude` 进程内；退出后不会持久化历史。`/clear` 和 `/reset` 会立即清空当前会话历史。
 
 如果某一轮流式请求被 provider 或代理中途关闭，`jclaude` 会保留当前交互会话并输出错误，用户可以直接继续下一条命令，而不需要重新启动 CLI。
+
+如果 provider 因输出上限截断了当前轮回复，`jclaude` 会自动发出一条恢复提示，让模型直接从中断位置继续；如果对端返回空白结束轮次，则会明确提示错误而不是静默回到提示符。
 
 ### 交互补全
 
