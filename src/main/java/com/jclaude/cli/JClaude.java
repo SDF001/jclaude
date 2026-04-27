@@ -38,7 +38,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 public final class JClaude {
-    private static final String VERSION = "0.1.4";
+    private static final String VERSION = "0.1.5";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
@@ -56,8 +56,15 @@ public final class JClaude {
     private static final int DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
     private static final int MAX_COMMAND_TIMEOUT_SECONDS = 600;
     private static final int MAX_COMMAND_OUTPUT_BYTES = 200_000;
-    private static final int STREAMING_REQUEST_COMPACT_TRIGGER_BYTES = 140_000;
-    private static final int STREAMING_REQUEST_COMPACT_TARGET_BYTES = 110_000;
+    private static final int MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000;
+    private static final int DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
+    private static final int CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000;
+    private static final int GPT5_CONTEXT_WINDOW_TOKENS = 1_000_000;
+    private static final int GEMINI_CONTEXT_WINDOW_TOKENS = 1_000_000;
+    private static final int RESERVED_OUTPUT_TOKENS = 20_000;
+    private static final int AUTOCOMPACT_BUFFER_TOKENS = 13_000;
+    private static final int AUTOCOMPACT_TARGET_BUFFER_TOKENS = 21_000;
+    private static final int REQUEST_BYTES_PER_TOKEN_ESTIMATE = 4;
     private static final int COMPACTED_TOOL_RESULT_PREVIEW_CHARS = 8_000;
     private static final int MAX_OUTPUT_RECOVERY_ATTEMPTS = 2;
     private static final String COMPACTED_TOOL_RESULT_NOTICE = """
@@ -138,9 +145,7 @@ public final class JClaude {
 
         EffectiveConfig config = effectiveConfig(request);
         AgentSession agentSession = new AgentSession();
-        prompt = config.skills().resolveInvocation(prompt)
-                .map(SkillInvocation::expandedPrompt)
-                .orElse(prompt);
+        prompt = expandSkillInvocation(prompt, config);
         PromptInput promptInput = PromptInput.parse(prompt);
         String outputFormat = config.outputFormat();
         String model = config.model();
@@ -223,8 +228,10 @@ public final class JClaude {
                         continue;
                     }
                     System.out.println("Running skill: " + invocation.get().skill().name());
+                    String expandedPrompt = expandSkillInvocation(invocation.get(), config);
+                    PromptInput skillPromptInput = PromptInput.parse(expandedPrompt);
                     List<ChatMessage> nextMessages = new ArrayList<>(history);
-                    nextMessages.add(new ChatMessage("user", invocation.get().expandedPrompt()));
+                    nextMessages.add(skillPromptInput.toChatMessage());
                     InteractiveStreamingObserver observer = new InteractiveStreamingObserver();
                     try {
                         String response = responseForStreaming(
@@ -401,10 +408,10 @@ public final class JClaude {
         System.out.println("Global config: " + configDir.resolve(".config.json"));
         System.out.println("Project settings: " + projectSettings);
         System.out.println("Local settings: " + localSettings);
-        System.out.println("Global skills: " + configDir.resolve("skills"));
-        System.out.println("Claude-compatible global skills: " + Path.of(System.getProperty("user.home"), ".claude", "skills").toAbsolutePath().normalize());
+        Optional<Path> projectSkills = SkillRegistry.findPreferredProjectSkillDir(Path.of("").toAbsolutePath().normalize());
         System.out.println("Project skills: " + Path.of(".jclaude", "skills").toAbsolutePath().normalize());
-        System.out.println("Claude-compatible project skills: " + Path.of(".claude", "skills").toAbsolutePath().normalize());
+        System.out.println("Global skills: " + configDir.resolve("skills"));
+        System.out.println("Effective skills source: " + projectSkills.orElse(configDir.resolve("skills")));
     }
 
     private void printSkills(SkillRegistry skills) {
@@ -605,8 +612,18 @@ public final class JClaude {
         return "Reached maximum number of turns (" + maxTurns + ")";
     }
 
-    private String systemPrompt(SkillRegistry skills, AgentSession agentSession) {
+    private String expandSkillInvocation(String prompt, EffectiveConfig config) throws IOException {
+        Optional<SkillInvocation> invocation = config.skills().resolveInvocation(prompt);
+        return invocation.map(SkillInvocation::expandedPrompt).orElse(prompt);
+    }
+
+    private String expandSkillInvocation(SkillInvocation invocation, EffectiveConfig config) throws IOException {
+        return invocation.expandedPrompt();
+    }
+
+    private String systemPrompt(SkillRegistry skills, AgentSession agentSession, String model, Provider provider) {
         String cwd = Path.of("").toAbsolutePath().normalize().toString();
+        ModelProfile profile = modelProfile(model, provider);
         String filesystemPrompt = """
                 # 语言
                 默认使用用户最近一条消息的语言回复；如果用户使用中文，必须用中文回复，除非用户明确要求使用其他语言。
@@ -633,7 +650,21 @@ public final class JClaude {
                 只有当工具结果明确成功时，才能告诉用户文件已读取、写入、修改或删除。如果工具返回错误或用户拒绝确认，必须明确说明操作没有执行。
                 Delete 是破坏性操作，jclaude 会在执行前请求用户显式确认。
                 在 Plan Mode 中 Bash/Write/Edit/Delete 会被拒绝。
-                """.formatted(agentSession.modeLabel(), cwd);
+                
+                # 当前模型能力
+                当前模型：%s
+                supports_vision=%s
+                estimated_context_window_tokens=%d
+                estimated_autocompact_threshold_tokens=%d
+                如果某项判断依赖图片内容，而 supports_vision=false，或者当前请求里并没有真的附带这些图片作为视觉输入，就不要臆测图片内容。
+                """.formatted(
+                agentSession.modeLabel(),
+                cwd,
+                profile.name(),
+                profile.supportsVision(),
+                profile.contextWindowTokens(),
+                autoCompactThresholdTokens(profile)
+        );
         String skillPrompt = skills.systemPrompt();
         if (skillPrompt.isBlank()) {
             return filesystemPrompt;
@@ -663,7 +694,7 @@ public final class JClaude {
             body.put("cache_control", Map.of("type", "ephemeral"));
             body.put("stream", true);
             body.put("tools", anthropicToolDefinitions());
-            String systemPrompt = systemPrompt(skills, agentSession);
+            String systemPrompt = systemPrompt(skills, agentSession, model, Provider.ANTHROPIC);
             if (!systemPrompt.isBlank()) {
                 body.put("system", systemPrompt);
             }
@@ -671,7 +702,7 @@ public final class JClaude {
                 body.put("thinking", Map.of("type", "adaptive"));
             }
             body.put("messages", payloadMessages);
-            compactRequestBodyIfNeeded(body, Provider.ANTHROPIC);
+            compactRequestBodyIfNeeded(body, Provider.ANTHROPIC, modelProfile(model, Provider.ANTHROPIC));
 
             StreamingAnthropicTurn streamingTurn = anthropicStreamingToolTurn(
                     apiUrl(baseUrl, "/v1/messages"),
@@ -827,20 +858,20 @@ public final class JClaude {
             Integer maxToolTurns,
             StreamingObserver observer
     ) throws IOException {
-        List<Map<String, Object>> payloadMessages = new ArrayList<>(openAiMessagePayload(messages, systemPrompt(skills, agentSession)));
+        List<Map<String, Object>> payloadMessages = new ArrayList<>(openAiMessagePayload(messages, systemPrompt(skills, agentSession, model, Provider.OPENAI)));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
         StringBuilder fullResponse = new StringBuilder();
         int outputRecoveryAttempts = 0;
         for (int turn = 0; maxToolTurns == null || turn < maxToolTurns; turn++) {
             if (turn > 0 && !payloadMessages.isEmpty() && "system".equals(payloadMessages.getFirst().get("role"))) {
-                payloadMessages.set(0, Map.of("role", "system", "content", systemPrompt(skills, agentSession)));
+                payloadMessages.set(0, Map.of("role", "system", "content", systemPrompt(skills, agentSession, model, Provider.OPENAI)));
             }
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
             body.put("messages", payloadMessages);
             body.put("stream", true);
             body.put("tools", openAiToolDefinitions());
-            compactRequestBodyIfNeeded(body, Provider.OPENAI);
+            compactRequestBodyIfNeeded(body, Provider.OPENAI, modelProfile(model, Provider.OPENAI));
 
             StreamingOpenAiTurn streamingTurn = openAiStreamingToolTurn(
                     apiUrl(baseUrl, "/v1/chat/completions"),
@@ -1182,35 +1213,158 @@ public final class JClaude {
         }
     }
 
-    private void compactRequestBodyIfNeeded(Map<String, Object> body, Provider provider) throws IOException {
-        if (serializedSize(body) <= STREAMING_REQUEST_COMPACT_TRIGGER_BYTES) {
-            return;
-        }
+    private void compactRequestBodyIfNeeded(Map<String, Object> body, Provider provider, ModelProfile profile) throws IOException {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> messages = (List<Map<String, Object>>) body.get("messages");
-        if (messages == null || messages.size() < 3) {
+        if (messages == null || messages.isEmpty()) {
             return;
         }
 
+        applyToolResultBudget(messages, provider);
+        if (messages.size() < 3) {
+            return;
+        }
+
+        int currentBytes = serializedSize(body);
+        if (currentBytes <= autoCompactThresholdBytes(profile)) {
+            return;
+        }
+        int targetBytes = autoCompactTargetBytes(profile);
+
         if (provider == Provider.ANTHROPIC) {
-            compactAnthropicMessages(messages, body, Math.max(1, messages.size() - 2), false);
-            compactAnthropicAssistantNarration(messages, body, Math.max(1, messages.size() - 2));
-            if (serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES) {
-                compactAnthropicMessages(messages, body, Math.max(1, messages.size() - 1), true);
-                compactAnthropicAssistantNarration(messages, body, Math.max(1, messages.size() - 1));
+            compactAnthropicMessages(messages, body, Math.max(1, messages.size() - 2), targetBytes, false);
+            compactAnthropicAssistantNarration(messages, body, Math.max(1, messages.size() - 2), targetBytes);
+            if (serializedSize(body) > targetBytes) {
+                compactAnthropicMessages(messages, body, Math.max(1, messages.size() - 1), targetBytes, true);
+                compactAnthropicAssistantNarration(messages, body, Math.max(1, messages.size() - 1), targetBytes);
             }
         } else {
-            compactOpenAiMessages(messages, body, Math.max(1, messages.size() - 2), false);
-            compactOpenAiAssistantNarration(messages, body, Math.max(1, messages.size() - 2));
-            if (serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES) {
-                compactOpenAiMessages(messages, body, Math.max(1, messages.size() - 1), true);
-                compactOpenAiAssistantNarration(messages, body, Math.max(1, messages.size() - 1));
+            compactOpenAiMessages(messages, body, Math.max(1, messages.size() - 2), targetBytes, false);
+            compactOpenAiAssistantNarration(messages, body, Math.max(1, messages.size() - 2), targetBytes);
+            if (serializedSize(body) > targetBytes) {
+                compactOpenAiMessages(messages, body, Math.max(1, messages.size() - 1), targetBytes, true);
+                compactOpenAiAssistantNarration(messages, body, Math.max(1, messages.size() - 1), targetBytes);
             }
         }
     }
 
-    private void compactAnthropicMessages(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, boolean aggressive) throws IOException {
-        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+    private void applyToolResultBudget(List<Map<String, Object>> messages, Provider provider) {
+        if (provider == Provider.ANTHROPIC) {
+            applyAnthropicToolResultBudget(messages);
+            return;
+        }
+        applyOpenAiToolResultBudget(messages);
+    }
+
+    private void applyAnthropicToolResultBudget(List<Map<String, Object>> messages) {
+        List<AnthropicToolResultBudgetEntry> group = new ArrayList<>();
+        for (int messageIndex = 0; messageIndex < messages.size(); messageIndex++) {
+            Map<String, Object> message = messages.get(messageIndex);
+            if ("assistant".equals(message.get("role"))) {
+                enforceAnthropicToolResultBudget(messages, group);
+                group.clear();
+                continue;
+            }
+            if (!"user".equals(message.get("role")) || !(message.get("content") instanceof List<?> rawBlocks)) {
+                continue;
+            }
+            for (int blockIndex = 0; blockIndex < rawBlocks.size(); blockIndex++) {
+                Object rawBlock = rawBlocks.get(blockIndex);
+                if (!(rawBlock instanceof Map<?, ?> rawMap)) {
+                    continue;
+                }
+                Map<String, Object> block = copyStringKeyMap(rawMap);
+                if ("tool_result".equals(block.get("type"))
+                        && block.get("content") instanceof String text
+                        && !isCompactedToolResult(text)) {
+                    group.add(new AnthropicToolResultBudgetEntry(messageIndex, blockIndex, text));
+                }
+            }
+        }
+        enforceAnthropicToolResultBudget(messages, group);
+    }
+
+    private void enforceAnthropicToolResultBudget(List<Map<String, Object>> messages, List<AnthropicToolResultBudgetEntry> group) {
+        int totalChars = group.stream().mapToInt(entry -> entry.text().length()).sum();
+        if (totalChars <= MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) {
+            return;
+        }
+        List<AnthropicToolResultBudgetEntry> sorted = new ArrayList<>(group);
+        sorted.sort(Comparator.comparingInt((AnthropicToolResultBudgetEntry entry) -> entry.text().length()).reversed());
+        for (AnthropicToolResultBudgetEntry entry : sorted) {
+            if (totalChars <= MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) {
+                break;
+            }
+            String compacted = compactToolResultTextForBudget(entry.text());
+            if (compacted.equals(entry.text())) {
+                continue;
+            }
+            replaceAnthropicToolResult(messages, entry.messageIndex(), entry.blockIndex(), compacted);
+            totalChars -= entry.text().length() - compacted.length();
+        }
+    }
+
+    private void replaceAnthropicToolResult(List<Map<String, Object>> messages, int messageIndex, int blockIndex, String compacted) {
+        Map<String, Object> message = messages.get(messageIndex);
+        if (!(message.get("content") instanceof List<?> rawBlocks)) {
+            return;
+        }
+        List<Map<String, Object>> updatedBlocks = new ArrayList<>();
+        for (int index = 0; index < rawBlocks.size(); index++) {
+            Object rawBlock = rawBlocks.get(index);
+            if (!(rawBlock instanceof Map<?, ?> rawMap)) {
+                continue;
+            }
+            Map<String, Object> block = copyStringKeyMap(rawMap);
+            if (index == blockIndex && "tool_result".equals(block.get("type"))) {
+                block.put("content", compacted);
+            }
+            updatedBlocks.add(block);
+        }
+        messages.set(messageIndex, Map.of("role", "user", "content", updatedBlocks));
+    }
+
+    private void applyOpenAiToolResultBudget(List<Map<String, Object>> messages) {
+        List<OpenAiToolResultBudgetEntry> group = new ArrayList<>();
+        for (int messageIndex = 0; messageIndex < messages.size(); messageIndex++) {
+            Map<String, Object> message = messages.get(messageIndex);
+            if ("assistant".equals(message.get("role"))) {
+                enforceOpenAiToolResultBudget(messages, group);
+                group.clear();
+                continue;
+            }
+            if (!"tool".equals(message.get("role")) || !(message.get("content") instanceof String text) || isCompactedToolResult(text)) {
+                continue;
+            }
+            group.add(new OpenAiToolResultBudgetEntry(messageIndex, text));
+        }
+        enforceOpenAiToolResultBudget(messages, group);
+    }
+
+    private void enforceOpenAiToolResultBudget(List<Map<String, Object>> messages, List<OpenAiToolResultBudgetEntry> group) {
+        int totalChars = group.stream().mapToInt(entry -> entry.text().length()).sum();
+        if (totalChars <= MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) {
+            return;
+        }
+        List<OpenAiToolResultBudgetEntry> sorted = new ArrayList<>(group);
+        sorted.sort(Comparator.comparingInt((OpenAiToolResultBudgetEntry entry) -> entry.text().length()).reversed());
+        for (OpenAiToolResultBudgetEntry entry : sorted) {
+            if (totalChars <= MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) {
+                break;
+            }
+            String compacted = compactToolResultTextForBudget(entry.text());
+            if (compacted.equals(entry.text())) {
+                continue;
+            }
+            Map<String, Object> updated = new LinkedHashMap<>(messages.get(entry.messageIndex()));
+            updated.put("content", compacted);
+            messages.set(entry.messageIndex(), updated);
+            totalChars -= entry.text().length() - compacted.length();
+        }
+    }
+
+    private void compactAnthropicMessages(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, int targetBytes, boolean aggressive) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > targetBytes; index++) {
             Map<String, Object> message = messages.get(index);
             if (!"user".equals(message.get("role"))) {
                 continue;
@@ -1241,8 +1395,8 @@ public final class JClaude {
         }
     }
 
-    private void compactAnthropicAssistantNarration(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore) throws IOException {
-        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+    private void compactAnthropicAssistantNarration(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, int targetBytes) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > targetBytes; index++) {
             Map<String, Object> message = messages.get(index);
             if (!"assistant".equals(message.get("role"))) {
                 continue;
@@ -1270,8 +1424,8 @@ public final class JClaude {
         }
     }
 
-    private void compactOpenAiMessages(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, boolean aggressive) throws IOException {
-        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+    private void compactOpenAiMessages(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, int targetBytes, boolean aggressive) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > targetBytes; index++) {
             Map<String, Object> message = messages.get(index);
             if (!"tool".equals(message.get("role")) || !(message.get("content") instanceof String text)) {
                 continue;
@@ -1285,8 +1439,8 @@ public final class JClaude {
         }
     }
 
-    private void compactOpenAiAssistantNarration(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore) throws IOException {
-        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+    private void compactOpenAiAssistantNarration(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, int targetBytes) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > targetBytes; index++) {
             Map<String, Object> message = messages.get(index);
             if (!"assistant".equals(message.get("role")) || !message.containsKey("tool_calls")) {
                 continue;
@@ -1339,8 +1493,65 @@ public final class JClaude {
         return notice + text.substring(0, COMPACTED_TOOL_RESULT_PREVIEW_CHARS) + System.lineSeparator() + "[...truncated...]";
     }
 
+    private String compactToolResultTextForBudget(String text) {
+        String preview = compactToolResultText(text, false);
+        if (!preview.equals(text) && preview.length() + 1024 < text.length()) {
+            return preview;
+        }
+        return compactToolResultText(text, true);
+    }
+
+    private boolean isCompactedToolResult(String text) {
+        return text != null && text.startsWith(COMPACTED_TOOL_RESULT_NOTICE);
+    }
+
     private int serializedSize(Map<String, Object> body) throws JsonProcessingException {
         return JSON.writeValueAsBytes(body).length;
+    }
+
+    private int autoCompactThresholdTokens(ModelProfile profile) {
+        return Math.max(16_000, effectiveContextWindowTokens(profile) - AUTOCOMPACT_BUFFER_TOKENS);
+    }
+
+    private int autoCompactThresholdBytes(ModelProfile profile) {
+        return estimatedBytesForTokens(autoCompactThresholdTokens(profile));
+    }
+
+    private int autoCompactTargetBytes(ModelProfile profile) {
+        return estimatedBytesForTokens(Math.max(8_000, effectiveContextWindowTokens(profile) - AUTOCOMPACT_TARGET_BUFFER_TOKENS));
+    }
+
+    private int effectiveContextWindowTokens(ModelProfile profile) {
+        return Math.max(32_000, profile.contextWindowTokens() - Math.min(profile.maxOutputTokens(), RESERVED_OUTPUT_TOKENS));
+    }
+
+    private int estimatedBytesForTokens(int tokens) {
+        long estimated = (long) tokens * REQUEST_BYTES_PER_TOKEN_ESTIMATE;
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(64_000L, estimated));
+    }
+
+    private ModelProfile modelProfile(String model, Provider provider) {
+        String normalized = model == null ? "" : model.trim().toLowerCase(java.util.Locale.ROOT);
+        int contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS;
+        if (normalized.contains("gpt-5") || normalized.contains("cc-gpt-5")) {
+            contextWindowTokens = GPT5_CONTEXT_WINDOW_TOKENS;
+        } else if (normalized.contains("gemini")) {
+            contextWindowTokens = GEMINI_CONTEXT_WINDOW_TOKENS;
+        } else if (normalized.contains("claude")) {
+            contextWindowTokens = CLAUDE_CONTEXT_WINDOW_TOKENS;
+        }
+        boolean supportsVision = normalized.contains("gpt-5")
+                || normalized.contains("cc-gpt-5")
+                || normalized.contains("gpt-4.1")
+                || normalized.contains("gpt-4o")
+                || normalized.contains("claude")
+                || normalized.contains("gemini")
+                || normalized.contains("vision")
+                || normalized.contains("vl");
+        if (provider == Provider.ANTHROPIC && normalized.contains("claude")) {
+            supportsVision = true;
+        }
+        return new ModelProfile(model, contextWindowTokens, 20_000, supportsVision);
     }
 
     private boolean looksLikeClosedStream(IOException exception) {
@@ -1515,7 +1726,6 @@ public final class JClaude {
                   -c, --continue                Continue last conversation placeholder
                   -r, --resume [id]             Resume conversation placeholder
                       --settings <path>         Settings file path placeholder
-                      --add-dir <path>          Additional directory to scan for .claude/.jclaude skills
                       --agents <path>           Agents directory placeholder
                   -v, --version                 Show version
                   -h, --help                    Show help
@@ -1534,7 +1744,8 @@ public final class JClaude {
                   Use ←/→ to edit in the middle; when autocomplete is closed, ↑/↓ recalls input history.
 
                 Skills:
-                  Put skills in .jclaude/skills/<name>/SKILL.md or .claude/skills/<name>/SKILL.md.
+                  If the current project has .jclaude/skills/<name>/SKILL.md, only project skills are loaded.
+                  Otherwise jclaude falls back to ~/.jclaude/skills/<name>/SKILL.md.
                   Invoke user skills with /<skill-name> [args].
                 """);
     }
@@ -2554,32 +2765,11 @@ public final class JClaude {
         }
 
         static SkillRegistry load(Path configDir, CliRequest request) throws IOException {
-            LinkedHashSet<Path> skillDirs = new LinkedHashSet<>();
-            addAdditionalSkillDirs(skillDirs, request.option("add-dir"));
-            addProjectSkillDirs(skillDirs, Path.of("").toAbsolutePath().normalize());
-
-            Path home = Path.of(System.getProperty("user.home")).toAbsolutePath().normalize();
-            addIfDirectory(skillDirs, configDir.resolve("skills"));
-            addIfDirectory(skillDirs, home.resolve(".jclaude").resolve("skills"));
-            addIfDirectory(skillDirs, home.resolve(".claude").resolve("skills"));
-
-            List<Skill> loaded = new ArrayList<>();
-            Set<Path> seenFiles = new HashSet<>();
-            Set<String> seenNames = new HashSet<>();
-            for (Path skillDir : skillDirs) {
-                for (Skill skill : loadSkillsFromDirectory(skillDir)) {
-                    Path identity = safeRealPath(skill.filePath());
-                    if (identity != null && !seenFiles.add(identity)) {
-                        continue;
-                    }
-                    String normalizedName = skill.name().toLowerCase();
-                    if (!seenNames.add(normalizedName)) {
-                        continue;
-                    }
-                    loaded.add(skill);
-                }
+            Optional<Path> projectSkillDir = findPreferredProjectSkillDir(Path.of("").toAbsolutePath().normalize());
+            if (projectSkillDir.isPresent()) {
+                return new SkillRegistry(loadSkillsFromDirectory(projectSkillDir.get()));
             }
-            return new SkillRegistry(loaded);
+            return new SkillRegistry(loadSkillsFromDirectory(configDir.resolve("skills")));
         }
 
         int size() {
@@ -2671,23 +2861,7 @@ public final class JClaude {
             return builder.toString();
         }
 
-        private static void addAdditionalSkillDirs(Set<Path> dirs, Optional<String> addDirOption) {
-            if (addDirOption.isEmpty() || addDirOption.get().isBlank()) {
-                return;
-            }
-            String[] rawDirs = addDirOption.get().split("\\s*(?:,|" + Pattern.quote(System.getProperty("path.separator")) + ")\\s*");
-            for (String rawDir : rawDirs) {
-                if (rawDir.isBlank()) {
-                    continue;
-                }
-                Path dir = Path.of(rawDir.trim()).toAbsolutePath().normalize();
-                addIfDirectory(dirs, dir);
-                addIfDirectory(dirs, dir.resolve(".jclaude").resolve("skills"));
-                addIfDirectory(dirs, dir.resolve(".claude").resolve("skills"));
-            }
-        }
-
-        private static void addProjectSkillDirs(Set<Path> dirs, Path cwd) {
+        static Optional<Path> findPreferredProjectSkillDir(Path cwd) throws IOException {
             Path home = Path.of(System.getProperty("user.home")).toAbsolutePath().normalize();
             Optional<Path> gitRoot = findGitRoot(cwd);
             Path current = cwd;
@@ -2695,8 +2869,10 @@ public final class JClaude {
                 if (samePath(current, home)) {
                     break;
                 }
-                addIfDirectory(dirs, current.resolve(".jclaude").resolve("skills"));
-                addIfDirectory(dirs, current.resolve(".claude").resolve("skills"));
+                Path candidate = current.resolve(".jclaude").resolve("skills");
+                if (containsLoadableSkills(candidate)) {
+                    return Optional.of(candidate.toAbsolutePath().normalize());
+                }
                 if (gitRoot.isPresent() && samePath(current, gitRoot.get())) {
                     break;
                 }
@@ -2706,6 +2882,14 @@ public final class JClaude {
                 }
                 current = parent;
             }
+            return Optional.empty();
+        }
+
+        private static boolean containsLoadableSkills(Path skillsDir) throws IOException {
+            if (!Files.isDirectory(skillsDir)) {
+                return false;
+            }
+            return !loadSkillsFromDirectory(skillsDir).isEmpty();
         }
 
         private static Optional<Path> findGitRoot(Path cwd) {
@@ -4163,6 +4347,15 @@ public final class JClaude {
             }
             return builder.toString();
         }
+    }
+
+    private record ModelProfile(String name, int contextWindowTokens, int maxOutputTokens, boolean supportsVision) {
+    }
+
+    private record AnthropicToolResultBudgetEntry(int messageIndex, int blockIndex, String text) {
+    }
+
+    private record OpenAiToolResultBudgetEntry(int messageIndex, String text) {
     }
 
     private record InputToken(String value) {

@@ -1,6 +1,6 @@
 # jclaude
 
-`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.4`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
+`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.5`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
 
 - `anthropic`：Anthropic Messages API 格式，调用 `/v1/messages`，支持 SSE 流式输出和 tool use。
 - `openai`：OpenAI-compatible Chat Completions 格式，调用 `/v1/chat/completions`，可用于 DeepSeek 等兼容 OpenAI API 的服务，支持 SSE 流式输出和 function tools。
@@ -20,12 +20,13 @@
 - OpenAI-compatible provider 会保留并续传 DeepSeek 等模型返回的 `reasoning_content`，兼容 thinking mode 多轮工具调用。
 - 交互模式会显示 `思考中...`、工具开始和工具结果状态，避免多轮工具调用时文本挤在同一行。
 - 交互模式中，单轮 provider/SSE 异常只会结束当前轮并保留 REPL，不会因为一次 `closed`/断流直接退出整个 CLI。
-- 在多轮工具调用请求过大时，会自动压缩较早的工具结果与中间说明，降低长任务触发上游断流的概率。
+- 在多轮工具调用请求过大时，会先对单轮工具结果应用预算控制，再根据模型上下文窗口做更保守的请求压缩，降低长任务触发上游断流的概率。
 - 当 provider 因输出长度提前截断响应时，`jclaude` 会自动追加一轮恢复提示，让模型从中断处继续，而不是静默结束任务。
 - 如果 provider 返回空白 assistant 结束轮次，`jclaude` 会显式报错并保留会话，避免看起来“执行成功但什么都没生成”。
 - `-p` 非交互模式支持 `--max-turns <N>` 限制 agentic turns；交互模式默认不限制。
 - 交互输入支持 `/` 命令补全、`@` 文件补全、光标左右移动、输入历史和长行横向滚动。
 - 支持本地 skills、图片输入、配置文件和 Anthropic/OpenAI-compatible provider。
+- skill 调用展开后的 prompt 会再次按普通输入解析，因此 skill 里内联的本地图片路径也能作为真实图片输入发送给支持视觉能力的模型。
 
 ## 构建项目
 
@@ -36,7 +37,7 @@ mvn package
 构建完成后会生成：
 
 ```sh
-target/jclaude-0.1.4.jar
+target/jclaude-0.1.5.jar
 ```
 
 ## 启动项目
@@ -56,7 +57,7 @@ mvn package
 ### 方式二：直接运行 jar
 
 ```sh
-java -jar target/jclaude-0.1.4.jar --help
+java -jar target/jclaude-0.1.5.jar --help
 ```
 
 ## 基本用法
@@ -143,7 +144,7 @@ jclaude> 我刚才让你记住的词是什么？
 
 这些工具由模型在 ReAct 循环中调用，不是用户直接输入的 shell 命令。只有工具结果明确成功时，模型才应该告知用户“已读取/写入/编辑/删除”；如果工具失败或用户拒绝确认，操作不会执行。
 
-为减少长链路任务在多轮工具调用后的上下文膨胀，`jclaude` 在发送下一轮流式请求前，可能会压缩较早的工具结果和中间 assistant 说明；如果模型确实还需要完整内容，应再次调用相应工具重新读取。
+为减少长链路任务在多轮工具调用后的上下文膨胀，`jclaude` 在发送下一轮流式请求前，会先对单轮工具结果应用聚合预算控制，再根据当前模型的估算上下文窗口决定是否进一步压缩较早的工具结果和中间 assistant 说明；如果模型确实还需要完整内容，应再次调用相应工具重新读取。
 
 `Bash` 适合让模型查看命令结果，例如：
 
@@ -223,11 +224,11 @@ jclaude> "@/Users/huanglei/Pictures/my image.png" 描述一下这张图片
 
 支持的目录：
 
-- 当前项目向上查找：`.jclaude/skills/<skill-name>/SKILL.md`
-- Claude Code 兼容路径：`.claude/skills/<skill-name>/SKILL.md`
-- 用户级路径：`~/.jclaude/skills/<skill-name>/SKILL.md`
-- Claude Code 用户级兼容路径：`~/.claude/skills/<skill-name>/SKILL.md`
-- 额外路径：`--add-dir <dir>` 会扫描 `<dir>/.jclaude/skills` 和 `<dir>/.claude/skills`
+- 当前项目向上查找最近的：`.jclaude/skills/<skill-name>/SKILL.md`
+- 如果找到了至少一个有效项目 skill，则只加载该项目技能目录
+- 如果当前项目没有有效 skill，则回退到用户级：`~/.jclaude/skills/<skill-name>/SKILL.md`
+
+查看配置路径时，`/config` 会额外显示当前实际生效的 skills 来源目录。
 
 示例：
 
