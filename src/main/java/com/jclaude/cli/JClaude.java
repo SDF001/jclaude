@@ -38,7 +38,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 public final class JClaude {
-    private static final String VERSION = "0.1.2";
+    private static final String VERSION = "0.1.3";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
@@ -56,6 +56,13 @@ public final class JClaude {
     private static final int DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
     private static final int MAX_COMMAND_TIMEOUT_SECONDS = 600;
     private static final int MAX_COMMAND_OUTPUT_BYTES = 200_000;
+    private static final int STREAMING_REQUEST_COMPACT_TRIGGER_BYTES = 140_000;
+    private static final int STREAMING_REQUEST_COMPACT_TARGET_BYTES = 110_000;
+    private static final int COMPACTED_TOOL_RESULT_PREVIEW_CHARS = 8_000;
+    private static final String COMPACTED_TOOL_RESULT_NOTICE = """
+            <system-reminder>较早的工具结果已被 jclaude 压缩以控制请求大小。
+            如果后续确实需要完整内容，请再次调用对应工具重新读取或执行。</system-reminder>
+            """;
     private static final Pattern AT_FILE_REFERENCE_PATTERN = Pattern.compile("(^|\\s)@(?:\"([^\"]+)\"|([^\\s]+))");
     private static final Pattern AT_FILE_LINE_RANGE_PATTERN = Pattern.compile("^([^#]+)(?:#L(\\d+)(?:-(\\d+))?)?(?:#[^#]*)?$");
 
@@ -226,11 +233,14 @@ public final class JClaude {
                         history.addAll(nextMessages);
                         history.add(new ChatMessage("assistant", response));
                     } catch (MaxToolTurnsException exception) {
-                        observer.finish();
                         System.out.println(maxTurnsMessage(exception.maxTurns()));
                         continue;
+                    } catch (CliException | IOException exception) {
+                        System.out.println("jclaude: " + interactiveErrorMessage(exception));
+                        continue;
+                    } finally {
+                        observer.finish();
                     }
-                    observer.finish();
                     continue;
                 }
                 List<ChatMessage> nextMessages = new ArrayList<>(history);
@@ -249,11 +259,14 @@ public final class JClaude {
                     history.addAll(nextMessages);
                     history.add(new ChatMessage("assistant", response));
                 } catch (MaxToolTurnsException exception) {
-                    observer.finish();
                     System.out.println(maxTurnsMessage(exception.maxTurns()));
                     continue;
+                } catch (CliException | IOException exception) {
+                    System.out.println("jclaude: " + interactiveErrorMessage(exception));
+                    continue;
+                } finally {
+                    observer.finish();
                 }
-                observer.finish();
             }
         }
     }
@@ -651,6 +664,7 @@ public final class JClaude {
                 body.put("thinking", Map.of("type", "adaptive"));
             }
             body.put("messages", payloadMessages);
+            compactRequestBodyIfNeeded(body, Provider.ANTHROPIC);
 
             StreamingAnthropicTurn streamingTurn = anthropicStreamingToolTurn(
                     apiUrl(baseUrl, "/v1/messages"),
@@ -793,6 +807,7 @@ public final class JClaude {
             body.put("messages", payloadMessages);
             body.put("stream", true);
             body.put("tools", openAiToolDefinitions());
+            compactRequestBodyIfNeeded(body, Provider.OPENAI);
 
             StreamingOpenAiTurn streamingTurn = openAiStreamingToolTurn(
                     apiUrl(baseUrl, "/v1/chat/completions"),
@@ -1067,6 +1082,7 @@ public final class JClaude {
             Map<String, String> headers,
             StreamingEventHandler handler
     ) throws IOException {
+        int requestBodyBytes = JSON.writeValueAsBytes(body).length;
         try {
             HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofMinutes(5))
@@ -1101,12 +1117,172 @@ public final class JClaude {
                     processSseJsonEvent(eventData.toString(), handler);
                 }
             }
+        } catch (JsonProcessingException exception) {
+            throw new CliException("Invalid streaming JSON from provider: " + exception.getMessage());
+        } catch (IOException exception) {
+            if (looksLikeClosedStream(exception)) {
+                throw new CliException("Provider stream closed unexpectedly while reading SSE response (request body ~"
+                        + formatKiB(requestBodyBytes) + " KiB).");
+            }
+            throw exception;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new CliException("Request interrupted");
-        } catch (JsonProcessingException exception) {
-            throw new CliException("Invalid streaming JSON from provider: " + exception.getMessage());
         }
+    }
+
+    private void compactRequestBodyIfNeeded(Map<String, Object> body, Provider provider) throws IOException {
+        if (serializedSize(body) <= STREAMING_REQUEST_COMPACT_TRIGGER_BYTES) {
+            return;
+        }
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> messages = (List<Map<String, Object>>) body.get("messages");
+        if (messages == null || messages.size() < 3) {
+            return;
+        }
+
+        if (provider == Provider.ANTHROPIC) {
+            compactAnthropicMessages(messages, body, Math.max(1, messages.size() - 2), false);
+            compactAnthropicAssistantNarration(messages, body, Math.max(1, messages.size() - 2));
+            if (serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES) {
+                compactAnthropicMessages(messages, body, Math.max(1, messages.size() - 1), true);
+                compactAnthropicAssistantNarration(messages, body, Math.max(1, messages.size() - 1));
+            }
+        } else {
+            compactOpenAiMessages(messages, body, Math.max(1, messages.size() - 2), false);
+            compactOpenAiAssistantNarration(messages, body, Math.max(1, messages.size() - 2));
+            if (serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES) {
+                compactOpenAiMessages(messages, body, Math.max(1, messages.size() - 1), true);
+                compactOpenAiAssistantNarration(messages, body, Math.max(1, messages.size() - 1));
+            }
+        }
+    }
+
+    private void compactAnthropicMessages(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, boolean aggressive) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+            Map<String, Object> message = messages.get(index);
+            if (!"user".equals(message.get("role"))) {
+                continue;
+            }
+            Object content = message.get("content");
+            if (!(content instanceof List<?> rawBlocks)) {
+                continue;
+            }
+            boolean touched = false;
+            List<Map<String, Object>> newBlocks = new ArrayList<>();
+            for (Object rawBlock : rawBlocks) {
+                if (!(rawBlock instanceof Map<?, ?> rawMap)) {
+                    continue;
+                }
+                Map<String, Object> block = copyStringKeyMap(rawMap);
+                if ("tool_result".equals(block.get("type")) && block.get("content") instanceof String text) {
+                    String compacted = compactToolResultText(text, aggressive);
+                    if (!compacted.equals(text)) {
+                        block.put("content", compacted);
+                        touched = true;
+                    }
+                }
+                newBlocks.add(block);
+            }
+            if (touched) {
+                messages.set(index, Map.of("role", "user", "content", newBlocks));
+            }
+        }
+    }
+
+    private void compactAnthropicAssistantNarration(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+            Map<String, Object> message = messages.get(index);
+            if (!"assistant".equals(message.get("role"))) {
+                continue;
+            }
+            Object content = message.get("content");
+            if (!(content instanceof List<?> rawBlocks)) {
+                continue;
+            }
+            List<Map<String, Object>> toolUseBlocks = new ArrayList<>();
+            boolean removedNarration = false;
+            for (Object rawBlock : rawBlocks) {
+                if (!(rawBlock instanceof Map<?, ?> rawMap)) {
+                    continue;
+                }
+                Map<String, Object> block = copyStringKeyMap(rawMap);
+                if ("tool_use".equals(block.get("type"))) {
+                    toolUseBlocks.add(block);
+                } else {
+                    removedNarration = true;
+                }
+            }
+            if (removedNarration && !toolUseBlocks.isEmpty()) {
+                messages.set(index, Map.of("role", "assistant", "content", toolUseBlocks));
+            }
+        }
+    }
+
+    private void compactOpenAiMessages(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore, boolean aggressive) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+            Map<String, Object> message = messages.get(index);
+            if (!"tool".equals(message.get("role")) || !(message.get("content") instanceof String text)) {
+                continue;
+            }
+            String compacted = compactToolResultText(text, aggressive);
+            if (!compacted.equals(text)) {
+                Map<String, Object> updated = new LinkedHashMap<>(message);
+                updated.put("content", compacted);
+                messages.set(index, updated);
+            }
+        }
+    }
+
+    private void compactOpenAiAssistantNarration(List<Map<String, Object>> messages, Map<String, Object> body, int compactBefore) throws IOException {
+        for (int index = 0; index < compactBefore && serializedSize(body) > STREAMING_REQUEST_COMPACT_TARGET_BYTES; index++) {
+            Map<String, Object> message = messages.get(index);
+            if (!"assistant".equals(message.get("role")) || !message.containsKey("tool_calls")) {
+                continue;
+            }
+            Map<String, Object> updated = new LinkedHashMap<>(message);
+            updated.put("content", null);
+            updated.remove("reasoning_content");
+            messages.set(index, updated);
+        }
+    }
+
+    private Map<String, Object> copyStringKeyMap(Map<?, ?> source) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : source.entrySet()) {
+            result.put(String.valueOf(entry.getKey()), entry.getValue());
+        }
+        return result;
+    }
+
+    private String compactToolResultText(String text, boolean aggressive) {
+        if (text == null || text.isBlank()) {
+            return text;
+        }
+        String notice = COMPACTED_TOOL_RESULT_NOTICE + System.lineSeparator();
+        if (text.startsWith(COMPACTED_TOOL_RESULT_NOTICE)) {
+            return text;
+        }
+        if (aggressive) {
+            return notice + "[tool result omitted]";
+        }
+        if (text.length() <= COMPACTED_TOOL_RESULT_PREVIEW_CHARS) {
+            return text;
+        }
+        return notice + text.substring(0, COMPACTED_TOOL_RESULT_PREVIEW_CHARS) + System.lineSeparator() + "[...truncated...]";
+    }
+
+    private int serializedSize(Map<String, Object> body) throws JsonProcessingException {
+        return JSON.writeValueAsBytes(body).length;
+    }
+
+    private boolean looksLikeClosedStream(IOException exception) {
+        String message = exception.getMessage();
+        return message != null && "closed".equalsIgnoreCase(message.trim());
+    }
+
+    private String formatKiB(int bytes) {
+        return String.format(java.util.Locale.ROOT, "%.1f", bytes / 1024.0);
     }
 
     private boolean processSseJsonEvent(String rawData, StreamingEventHandler handler) throws IOException {
@@ -1209,6 +1385,14 @@ public final class JClaude {
             }
         }
         return null;
+    }
+
+    private static String interactiveErrorMessage(Exception exception) {
+        String message = exception.getMessage();
+        if (message == null || message.isBlank()) {
+            return exception.getClass().getSimpleName();
+        }
+        return message;
     }
 
     private static int parsePositiveCliInt(String optionName, String rawValue) {
