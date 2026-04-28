@@ -3,7 +3,16 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 APP_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-JAR="$APP_DIR/target/jclaude-0.1.5.jar"
+VERSION=$(
+  sed -n 's:.*<version>\([^<][^<]*\)</version>.*:\1:p' "$APP_DIR/pom.xml" | head -n 1
+)
+
+if [ -z "${VERSION:-}" ]; then
+  echo "jclaude: failed to read project version from $APP_DIR/pom.xml." >&2
+  exit 1
+fi
+
+JAR="$APP_DIR/target/jclaude-$VERSION.jar"
 
 if [ ! -f "$JAR" ]; then
   echo "jclaude: $JAR not found. Run 'mvn package' first." >&2

@@ -1,6 +1,6 @@
 # jclaude
 
-`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.6`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
+`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.7`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
 
 - `anthropic`：Anthropic Messages API 格式，调用 `/v1/messages`，支持 SSE 流式输出和 tool use。
 - `openai`：OpenAI-compatible Chat Completions 格式，调用 `/v1/chat/completions`，可用于 DeepSeek 等兼容 OpenAI API 的服务，支持 SSE 流式输出和 function tools。
@@ -39,8 +39,10 @@ mvn package
 构建完成后会生成：
 
 ```sh
-target/jclaude-0.1.6.jar
+target/jclaude-0.1.7.jar
 ```
+
+`bin/jclaude` 会从 `pom.xml` 读取当前项目版本，并启动对应的 `target/jclaude-<version>.jar`。这样即使 `target/` 目录里残留了旧版本 jar，也不会误启动到别的版本。
 
 ## 启动项目
 
@@ -59,7 +61,7 @@ mvn package
 ### 方式二：直接运行 jar
 
 ```sh
-java -jar target/jclaude-0.1.6.jar --help
+java -jar target/jclaude-0.1.7.jar --help
 ```
 
 ## 基本用法
@@ -454,6 +456,24 @@ ANTHROPIC_API_KEY="你的 DeepSeek API Key" \
 - `supportsVision` 会基于模型名做启发式判断，也可以在 `modelProfiles` 里显式覆盖
 
 你可以通过 `./bin/jclaude doctor` 或交互模式里的 `/status` 查看当前模型最终命中的 profile 值。
+
+## 发版说明
+
+如果要更新版本号并创建新的 git tag，至少需要同步这些位置：
+
+- `pom.xml`：Maven 项目版本，也是 `bin/jclaude` 选择目标 jar 的单一版本源
+- `src/main/java/com/jclaude/cli/JClaude.java`：`--version` 和 banner 显示的 CLI 版本
+- `README.md`：文档里的“当前版本”和示例 jar 文件名
+
+发版步骤建议如下：
+
+1. 先同步修改上面 3 个位置的版本号。
+2. 运行 `mvn package`，确认产物是 `target/jclaude-<version>.jar`。
+3. 用 `./bin/jclaude --version` 验证脚本和 CLI 显示的版本一致。
+4. 提交代码后创建对应 tag，例如 `v0.1.7`。
+5. 推送分支和 tag 到远程仓库。
+
+注意：`bin/jclaude` 不需要在每次发版时手动改 jar 文件名；它会自动按 `pom.xml` 里的版本寻找对应产物。
 
 ### `apiKeyEnv`：推荐方式
 

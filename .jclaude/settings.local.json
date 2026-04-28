@@ -1,0 +1,7 @@
+{
+  "provider": "anthropic",
+  "model": "deepseek-v4-pro",
+  "baseUrl": "https://api.deepseek.com/anthropic",
+  "outputFormat": "text",
+  "apiKey": "sk-xxx"
+}

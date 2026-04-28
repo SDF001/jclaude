@@ -38,7 +38,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 public final class JClaude {
-    private static final String VERSION = "0.1.6";
+    private static final String VERSION = "0.1.7";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
