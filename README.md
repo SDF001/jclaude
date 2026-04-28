@@ -1,6 +1,6 @@
 # jclaude
 
-`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.5`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
+`jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.6`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
 
 - `anthropic`：Anthropic Messages API 格式，调用 `/v1/messages`，支持 SSE 流式输出和 tool use。
 - `openai`：OpenAI-compatible Chat Completions 格式，调用 `/v1/chat/completions`，可用于 DeepSeek 等兼容 OpenAI API 的服务，支持 SSE 流式输出和 function tools。
@@ -21,6 +21,8 @@
 - 交互模式会显示 `思考中...`、工具开始和工具结果状态，避免多轮工具调用时文本挤在同一行。
 - 交互模式中，单轮 provider/SSE 异常只会结束当前轮并保留 REPL，不会因为一次 `closed`/断流直接退出整个 CLI。
 - 在多轮工具调用请求过大时，会先对单轮工具结果应用预算控制，再根据模型上下文窗口做更保守的请求压缩，降低长任务触发上游断流的概率。
+- 支持按模型名匹配 `modelProfiles`，可分别控制 `contextWindowTokens`、`maxOutputTokens` 和 `supportsVision`。
+- `/status` 和 `doctor` 会显示当前生效的 context window tokens 与 max output tokens，便于排查 profile 命中结果。
 - 当 provider 因输出长度提前截断响应时，`jclaude` 会自动追加一轮恢复提示，让模型从中断处继续，而不是静默结束任务。
 - 如果 provider 返回空白 assistant 结束轮次，`jclaude` 会显式报错并保留会话，避免看起来“执行成功但什么都没生成”。
 - `-p` 非交互模式支持 `--max-turns <N>` 限制 agentic turns；交互模式默认不限制。
@@ -37,7 +39,7 @@ mvn package
 构建完成后会生成：
 
 ```sh
-target/jclaude-0.1.5.jar
+target/jclaude-0.1.6.jar
 ```
 
 ## 启动项目
@@ -57,7 +59,7 @@ mvn package
 ### 方式二：直接运行 jar
 
 ```sh
-java -jar target/jclaude-0.1.5.jar --help
+java -jar target/jclaude-0.1.6.jar --help
 ```
 
 ## 基本用法
@@ -103,7 +105,7 @@ jclaude> 我刚才让你记住的词是什么？
 
 ```text
 /help      查看交互模式帮助
-/status    查看当前工作目录、配置目录、provider 和 model
+/status    查看当前工作目录、配置目录、provider、model、context window 和 max output tokens
 /config    查看配置文件路径
 /model     查看当前模型
 /skills    查看已加载的 skills
@@ -352,7 +354,12 @@ export JCLAUDE_API_KEY="你的 API Key"
 
 ### 使用 DeepSeek
 
-DeepSeek 使用 OpenAI-compatible API 格式，因此配置到 `openai` provider：
+DeepSeek 可以按你使用的网关协议接到不同 provider：
+
+- OpenAI-compatible endpoint：配置到 `openai` provider
+- Anthropic-compatible endpoint：配置到 `anthropic` provider
+
+OpenAI-compatible 示例：
 
 ```sh
 OPENAI_API_KEY="你的 DeepSeek API Key" \
@@ -373,6 +380,17 @@ export OPENAI_API_KEY="你的 DeepSeek API Key"
 ./bin/jclaude -p "你好"
 ```
 
+如果你使用的是 Anthropic-compatible 网关，则改为 `anthropic` provider 并填写对应 `baseUrl` 即可：
+
+```sh
+ANTHROPIC_API_KEY="你的 DeepSeek API Key" \
+./bin/jclaude -p \
+  --provider anthropic \
+  --base-url https://你的-anthropic-compatible-gateway \
+  --model deepseek-v4-pro \
+  "你好"
+```
+
 ## 配置文件
 
 `jclaude` 支持类似 Claude Code 的配置文件层级。推荐把非敏感配置写入 JSON 文件，把 API key 继续放在环境变量中。
@@ -389,12 +407,53 @@ export OPENAI_API_KEY="你的 DeepSeek API Key"
 ```json
 {
   "provider": "openai",
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-pro",
   "baseUrl": "https://api.deepseek.com",
   "outputFormat": "text",
-  "apiKeyEnv": "OPENAI_API_KEY"
+  "apiKeyEnv": "OPENAI_API_KEY",
+  "modelProfiles": {
+    "default": {
+      "contextWindowTokens": 256000,
+      "maxOutputTokens": 32000
+    },
+    "claude-*": {
+      "contextWindowTokens": 256000,
+      "maxOutputTokens": 32000
+    },
+    "deepseek-v4-*": {
+      "contextWindowTokens": 1000000,
+      "maxOutputTokens": 64000
+    },
+    "cc-gpt-5.4": {
+      "contextWindowTokens": 1000000,
+      "maxOutputTokens": 64000
+    }
+  }
 }
 ```
+
+`modelProfiles` 会按当前模型名匹配 profile，用来控制：
+
+- `contextWindowTokens`：上下文窗口估计值，影响自动压缩阈值
+- `maxOutputTokens`：请求里的输出上限；Anthropic 和 OpenAI-compatible 两条 provider 路径都会使用
+- `supportsVision`：可选，手动覆盖视觉能力判断
+
+匹配规则：
+
+- `default` 或 `*`：兜底 profile
+- 精确模型名：例如 `cc-gpt-5.4`
+- `*` 通配：例如 `claude-*`、`deepseek-v4-*`
+
+如果多个 profile 同时匹配，会优先选择更具体的规则；同样具体度下，后定义的覆盖前定义的。
+
+如果没有命中自定义 profile，`jclaude` 会使用内置默认值：
+
+- 默认模型：`contextWindowTokens=256000`，`maxOutputTokens=32000`
+- `claude-*`：默认按 `256000 / 32000` 处理
+- `gpt-5*`、`cc-gpt-5*`、`gemini*`、`deepseek-v4*`：默认按 `1000000 / 32000` 处理
+- `supportsVision` 会基于模型名做启发式判断，也可以在 `modelProfiles` 里显式覆盖
+
+你可以通过 `./bin/jclaude doctor` 或交互模式里的 `/status` 查看当前模型最终命中的 profile 值。
 
 ### `apiKeyEnv`：推荐方式
 
@@ -407,10 +466,16 @@ mkdir -p .jclaude
 cat > .jclaude/settings.json <<'JSON'
 {
   "provider": "openai",
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-pro",
   "baseUrl": "https://api.deepseek.com",
   "outputFormat": "text",
-  "apiKeyEnv": "OPENAI_API_KEY"
+  "apiKeyEnv": "OPENAI_API_KEY",
+  "modelProfiles": {
+    "deepseek-v4-*": {
+      "contextWindowTokens": 1000000,
+      "maxOutputTokens": 64000
+    }
+  }
 }
 JSON
 
@@ -471,6 +536,7 @@ JSON
 - `outputFormat` / `output_format`：`text`、`json` 或 `stream-json`
 - `apiKey` / `api_key`：直接写入 API key，适合个人本机快速启动，但会明文保存
 - `apiKeyEnv` / `api_key_env`：写环境变量名，`jclaude` 会从该环境变量读取 API key，推荐使用
+- `modelProfiles` / `model_profiles`：按模型名配置 `contextWindowTokens`、`maxOutputTokens`、`supportsVision`
 
 ### 常用环境变量
 

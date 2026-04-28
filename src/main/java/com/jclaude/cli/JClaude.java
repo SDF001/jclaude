@@ -38,7 +38,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 public final class JClaude {
-    private static final String VERSION = "0.1.5";
+    private static final String VERSION = "0.1.6";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
@@ -57,10 +57,12 @@ public final class JClaude {
     private static final int MAX_COMMAND_TIMEOUT_SECONDS = 600;
     private static final int MAX_COMMAND_OUTPUT_BYTES = 200_000;
     private static final int MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000;
-    private static final int DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
-    private static final int CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000;
+    private static final int DEFAULT_CONTEXT_WINDOW_TOKENS = 256_000;
+    private static final int CLAUDE_CONTEXT_WINDOW_TOKENS = 256_000;
     private static final int GPT5_CONTEXT_WINDOW_TOKENS = 1_000_000;
     private static final int GEMINI_CONTEXT_WINDOW_TOKENS = 1_000_000;
+    private static final int DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS = 1_000_000;
+    private static final int DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
     private static final int RESERVED_OUTPUT_TOKENS = 20_000;
     private static final int AUTOCOMPACT_BUFFER_TOKENS = 13_000;
     private static final int AUTOCOMPACT_TARGET_BUFFER_TOKENS = 21_000;
@@ -345,6 +347,8 @@ public final class JClaude {
         System.out.println("Provider: " + config.provider().id());
         System.out.println("Model: " + config.model());
         config.baseUrl().ifPresent(value -> System.out.println("Base URL: " + value));
+        System.out.println("Context window tokens: " + config.modelProfile().contextWindowTokens());
+        System.out.println("Max output tokens: " + config.modelProfile().maxOutputTokens());
         System.out.println("Output format: " + config.outputFormat());
         System.out.println("API key: " + (config.apiKey().isPresent() ? "set" : "not set"));
         System.out.println("Skills: " + config.skills().size());
@@ -396,6 +400,8 @@ public final class JClaude {
         System.out.println("Provider: " + config.provider().id());
         System.out.println("Model: " + config.model());
         config.baseUrl().ifPresent(value -> System.out.println("Base URL: " + value));
+        System.out.println("Context window tokens: " + config.modelProfile().contextWindowTokens());
+        System.out.println("Max output tokens: " + config.modelProfile().maxOutputTokens());
         System.out.println("Skills: " + config.skills().size());
     }
 
@@ -435,55 +441,58 @@ public final class JClaude {
     }
 
     private EffectiveConfig effectiveConfig(CliRequest request) throws IOException {
-        Map<String, String> fileConfig = loadFileConfig();
+        FileConfig fileConfig = loadFileConfig();
+        Map<String, String> fileValues = fileConfig.values();
         Provider provider = Provider.parse(firstNonBlank(
                 request.option("provider").orElse(null),
                 System.getenv("JCLAUDE_PROVIDER"),
-                fileConfig.get("provider"),
+                fileValues.get("provider"),
                 "anthropic"
         ));
         String model = firstNonBlank(
                 request.option("model").orElse(null),
                 System.getenv("JCLAUDE_MODEL"),
                 provider == Provider.ANTHROPIC ? System.getenv("ANTHROPIC_MODEL") : System.getenv("OPENAI_MODEL"),
-                fileConfig.get("model"),
+                fileValues.get("model"),
                 defaultModel(provider)
         );
         Optional<String> baseUrl = Optional.ofNullable(firstNonBlank(
                 request.option("base-url").orElse(null),
                 System.getenv("JCLAUDE_BASE_URL"),
                 provider == Provider.ANTHROPIC ? System.getenv("ANTHROPIC_BASE_URL") : System.getenv("OPENAI_BASE_URL"),
-                fileConfig.get("baseUrl"),
-                fileConfig.get("base_url")
+                fileValues.get("baseUrl"),
+                fileValues.get("base_url")
         ));
         String outputFormat = firstNonBlank(
                 request.option("output-format").orElse(null),
                 System.getenv("JCLAUDE_OUTPUT_FORMAT"),
-                fileConfig.get("outputFormat"),
-                fileConfig.get("output_format"),
+                fileValues.get("outputFormat"),
+                fileValues.get("output_format"),
                 "text"
         );
         Optional<String> apiKey = Optional.ofNullable(firstNonBlank(
-                envValue(fileConfig.get("apiKeyEnv")),
-                envValue(fileConfig.get("api_key_env")),
+                envValue(fileValues.get("apiKeyEnv")),
+                envValue(fileValues.get("api_key_env")),
                 apiKey(provider),
-                fileConfig.get("apiKey"),
-                fileConfig.get("api_key")
+                fileValues.get("apiKey"),
+                fileValues.get("api_key")
         ));
         SkillRegistry skills = SkillRegistry.load(configDir(), request);
-        return new EffectiveConfig(provider, model, baseUrl, outputFormat, apiKey, skills);
+        ModelProfile modelProfile = resolveModelProfile(model, provider, fileConfig.modelProfiles());
+        return new EffectiveConfig(provider, model, baseUrl, outputFormat, apiKey, skills, modelProfile);
     }
 
-    private Map<String, String> loadFileConfig() throws IOException {
+    private FileConfig loadFileConfig() throws IOException {
         Map<String, String> values = new LinkedHashMap<>();
-        mergeConfig(values, configDir().resolve("settings.json"));
-        mergeConfig(values, configDir().resolve("settings.local.json"));
-        mergeConfig(values, Path.of(".jclaude", "settings.json").toAbsolutePath().normalize());
-        mergeConfig(values, Path.of(".jclaude", "settings.local.json").toAbsolutePath().normalize());
-        return values;
+        LinkedHashMap<String, ModelProfileOverride> modelProfiles = new LinkedHashMap<>();
+        mergeConfig(values, modelProfiles, configDir().resolve("settings.json"));
+        mergeConfig(values, modelProfiles, configDir().resolve("settings.local.json"));
+        mergeConfig(values, modelProfiles, Path.of(".jclaude", "settings.json").toAbsolutePath().normalize());
+        mergeConfig(values, modelProfiles, Path.of(".jclaude", "settings.local.json").toAbsolutePath().normalize());
+        return new FileConfig(Map.copyOf(values), Map.copyOf(modelProfiles));
     }
 
-    private void mergeConfig(Map<String, String> values, Path path) throws IOException {
+    private void mergeConfig(Map<String, String> values, LinkedHashMap<String, ModelProfileOverride> modelProfiles, Path path) throws IOException {
         if (!Files.exists(path)) {
             return;
         }
@@ -501,6 +510,69 @@ public final class JClaude {
         putText(values, node, "api_key");
         putText(values, node, "apiKeyEnv");
         putText(values, node, "api_key_env");
+        mergeModelProfiles(modelProfiles, node.get("modelProfiles"), path, "modelProfiles");
+        mergeModelProfiles(modelProfiles, node.get("model_profiles"), path, "model_profiles");
+    }
+
+    private void mergeModelProfiles(LinkedHashMap<String, ModelProfileOverride> modelProfiles, JsonNode node, Path path, String key) {
+        if (node == null || node.isNull()) {
+            return;
+        }
+        if (!node.isObject()) {
+            throw new CliException("Config field '" + key + "' must be a JSON object: " + path);
+        }
+        node.fields().forEachRemaining(entry -> {
+            String pattern = entry.getKey().trim();
+            if (pattern.isBlank()) {
+                throw new CliException("Config field '" + key + "' cannot contain an empty model pattern: " + path);
+            }
+            JsonNode profileNode = entry.getValue();
+            if (!profileNode.isObject()) {
+                throw new CliException("Config field '" + key + "." + pattern + "' must be a JSON object: " + path);
+            }
+            Integer contextWindowTokens = readPositiveInt(profileNode, path, key + "." + pattern, "contextWindowTokens", "context_window_tokens");
+            Integer maxOutputTokens = readPositiveInt(profileNode, path, key + "." + pattern, "maxOutputTokens", "max_output_tokens");
+            Boolean supportsVision = readBoolean(profileNode, path, key + "." + pattern, "supportsVision", "supports_vision");
+            if (contextWindowTokens == null && maxOutputTokens == null && supportsVision == null) {
+                throw new CliException("Config field '" + key + "." + pattern + "' must set at least one of "
+                        + "contextWindowTokens/context_window_tokens, maxOutputTokens/max_output_tokens, "
+                        + "supportsVision/supports_vision: " + path);
+            }
+            modelProfiles.remove(pattern);
+            modelProfiles.put(pattern, new ModelProfileOverride(contextWindowTokens, maxOutputTokens, supportsVision));
+        });
+    }
+
+    private Integer readPositiveInt(JsonNode node, Path path, String configPath, String... keys) {
+        for (String key : keys) {
+            JsonNode value = node.get(key);
+            if (value == null || value.isNull()) {
+                continue;
+            }
+            if (!value.canConvertToInt()) {
+                throw new CliException("Config field '" + configPath + "." + key + "' must be a positive integer: " + path);
+            }
+            int parsed = value.asInt();
+            if (parsed <= 0) {
+                throw new CliException("Config field '" + configPath + "." + key + "' must be a positive integer: " + path);
+            }
+            return parsed;
+        }
+        return null;
+    }
+
+    private Boolean readBoolean(JsonNode node, Path path, String configPath, String... keys) {
+        for (String key : keys) {
+            JsonNode value = node.get(key);
+            if (value == null || value.isNull()) {
+                continue;
+            }
+            if (!value.isBoolean()) {
+                throw new CliException("Config field '" + configPath + "." + key + "' must be a boolean: " + path);
+            }
+            return value.asBoolean();
+        }
+        return null;
     }
 
     private void putText(Map<String, String> values, JsonNode node, String key) {
@@ -556,6 +628,7 @@ public final class JClaude {
                     config.apiKey().orElseThrow(),
                     config.baseUrl().orElseGet(() -> baseUrl(config.provider())),
                     config.skills(),
+                    config.modelProfile(),
                     agentSession,
                     allowDestructiveConfirmation,
                     maxToolTurns,
@@ -567,6 +640,7 @@ public final class JClaude {
                     config.apiKey().orElseThrow(),
                     config.baseUrl().orElseGet(() -> baseUrl(config.provider())),
                     config.skills(),
+                    config.modelProfile(),
                     agentSession,
                     allowDestructiveConfirmation,
                     maxToolTurns,
@@ -621,9 +695,8 @@ public final class JClaude {
         return invocation.expandedPrompt();
     }
 
-    private String systemPrompt(SkillRegistry skills, AgentSession agentSession, String model, Provider provider) {
+    private String systemPrompt(SkillRegistry skills, AgentSession agentSession, ModelProfile profile) {
         String cwd = Path.of("").toAbsolutePath().normalize().toString();
-        ModelProfile profile = modelProfile(model, provider);
         String filesystemPrompt = """
                 # 语言
                 默认使用用户最近一条消息的语言回复；如果用户使用中文，必须用中文回复，除非用户明确要求使用其他语言。
@@ -678,6 +751,7 @@ public final class JClaude {
             String apiKey,
             String baseUrl,
             SkillRegistry skills,
+            ModelProfile profile,
             AgentSession agentSession,
             boolean allowDestructiveConfirmation,
             Integer maxToolTurns,
@@ -690,11 +764,11 @@ public final class JClaude {
         for (int turn = 0; maxToolTurns == null || turn < maxToolTurns; turn++) {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
-            body.put("max_tokens", 16_000);
+            body.put("max_tokens", profile.maxOutputTokens());
             body.put("cache_control", Map.of("type", "ephemeral"));
             body.put("stream", true);
             body.put("tools", anthropicToolDefinitions());
-            String systemPrompt = systemPrompt(skills, agentSession, model, Provider.ANTHROPIC);
+            String systemPrompt = systemPrompt(skills, agentSession, profile);
             if (!systemPrompt.isBlank()) {
                 body.put("system", systemPrompt);
             }
@@ -702,7 +776,7 @@ public final class JClaude {
                 body.put("thinking", Map.of("type", "adaptive"));
             }
             body.put("messages", payloadMessages);
-            compactRequestBodyIfNeeded(body, Provider.ANTHROPIC, modelProfile(model, Provider.ANTHROPIC));
+            compactRequestBodyIfNeeded(body, Provider.ANTHROPIC, profile);
 
             StreamingAnthropicTurn streamingTurn = anthropicStreamingToolTurn(
                     apiUrl(baseUrl, "/v1/messages"),
@@ -853,25 +927,27 @@ public final class JClaude {
             String apiKey,
             String baseUrl,
             SkillRegistry skills,
+            ModelProfile profile,
             AgentSession agentSession,
             boolean allowDestructiveConfirmation,
             Integer maxToolTurns,
             StreamingObserver observer
     ) throws IOException {
-        List<Map<String, Object>> payloadMessages = new ArrayList<>(openAiMessagePayload(messages, systemPrompt(skills, agentSession, model, Provider.OPENAI)));
+        List<Map<String, Object>> payloadMessages = new ArrayList<>(openAiMessagePayload(messages, systemPrompt(skills, agentSession, profile)));
         ToolSession toolSession = new ToolSession(allowDestructiveConfirmation, agentSession);
         StringBuilder fullResponse = new StringBuilder();
         int outputRecoveryAttempts = 0;
         for (int turn = 0; maxToolTurns == null || turn < maxToolTurns; turn++) {
             if (turn > 0 && !payloadMessages.isEmpty() && "system".equals(payloadMessages.getFirst().get("role"))) {
-                payloadMessages.set(0, Map.of("role", "system", "content", systemPrompt(skills, agentSession, model, Provider.OPENAI)));
+                payloadMessages.set(0, Map.of("role", "system", "content", systemPrompt(skills, agentSession, profile)));
             }
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
             body.put("messages", payloadMessages);
+            body.put("max_tokens", profile.maxOutputTokens());
             body.put("stream", true);
             body.put("tools", openAiToolDefinitions());
-            compactRequestBodyIfNeeded(body, Provider.OPENAI, modelProfile(model, Provider.OPENAI));
+            compactRequestBodyIfNeeded(body, Provider.OPENAI, profile);
 
             StreamingOpenAiTurn streamingTurn = openAiStreamingToolTurn(
                     apiUrl(baseUrl, "/v1/chat/completions"),
@@ -1530,10 +1606,26 @@ public final class JClaude {
         return (int) Math.min(Integer.MAX_VALUE, Math.max(64_000L, estimated));
     }
 
-    private ModelProfile modelProfile(String model, Provider provider) {
+    private ModelProfile resolveModelProfile(String model, Provider provider, Map<String, ModelProfileOverride> overrides) {
+        ModelProfile profile = builtinModelProfile(model, provider);
+        ModelProfileOverride override = matchingModelProfileOverride(model, overrides);
+        if (override == null) {
+            return profile;
+        }
+        return new ModelProfile(
+                model,
+                override.contextWindowTokens() == null ? profile.contextWindowTokens() : override.contextWindowTokens(),
+                override.maxOutputTokens() == null ? profile.maxOutputTokens() : override.maxOutputTokens(),
+                override.supportsVision() == null ? profile.supportsVision() : override.supportsVision()
+        );
+    }
+
+    private ModelProfile builtinModelProfile(String model, Provider provider) {
         String normalized = model == null ? "" : model.trim().toLowerCase(java.util.Locale.ROOT);
         int contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS;
-        if (normalized.contains("gpt-5") || normalized.contains("cc-gpt-5")) {
+        if (normalized.contains("deepseek-v4")) {
+            contextWindowTokens = DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS;
+        } else if (normalized.contains("gpt-5") || normalized.contains("cc-gpt-5")) {
             contextWindowTokens = GPT5_CONTEXT_WINDOW_TOKENS;
         } else if (normalized.contains("gemini")) {
             contextWindowTokens = GEMINI_CONTEXT_WINDOW_TOKENS;
@@ -1551,7 +1643,64 @@ public final class JClaude {
         if (provider == Provider.ANTHROPIC && normalized.contains("claude")) {
             supportsVision = true;
         }
-        return new ModelProfile(model, contextWindowTokens, 20_000, supportsVision);
+        return new ModelProfile(model, contextWindowTokens, DEFAULT_MAX_OUTPUT_TOKENS, supportsVision);
+    }
+
+    private ModelProfileOverride matchingModelProfileOverride(String model, Map<String, ModelProfileOverride> overrides) {
+        if (overrides.isEmpty()) {
+            return null;
+        }
+        String normalizedModel = model == null ? "" : model.trim().toLowerCase(java.util.Locale.ROOT);
+        ModelProfileOverride best = null;
+        int bestScore = Integer.MIN_VALUE;
+        for (Map.Entry<String, ModelProfileOverride> entry : overrides.entrySet()) {
+            int score = modelProfileMatchScore(entry.getKey(), normalizedModel);
+            if (score >= bestScore && score != Integer.MIN_VALUE) {
+                best = entry.getValue();
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    private int modelProfileMatchScore(String pattern, String normalizedModel) {
+        String normalizedPattern = pattern == null ? "" : pattern.trim().toLowerCase(java.util.Locale.ROOT);
+        if (normalizedPattern.isBlank()) {
+            return Integer.MIN_VALUE;
+        }
+        if ("default".equals(normalizedPattern) || "*".equals(normalizedPattern)) {
+            return 0;
+        }
+        if (normalizedPattern.contains("*")) {
+            if (!globMatches(normalizedPattern, normalizedModel)) {
+                return Integer.MIN_VALUE;
+            }
+            return 1_000 + normalizedPattern.replace("*", "").length();
+        }
+        if (normalizedPattern.equals(normalizedModel)) {
+            return 10_000 + normalizedPattern.length();
+        }
+        return Integer.MIN_VALUE;
+    }
+
+    private boolean globMatches(String pattern, String value) {
+        StringBuilder regex = new StringBuilder("^");
+        int segmentStart = 0;
+        for (int index = 0; index < pattern.length(); index++) {
+            if (pattern.charAt(index) != '*') {
+                continue;
+            }
+            if (segmentStart < index) {
+                regex.append(Pattern.quote(pattern.substring(segmentStart, index)));
+            }
+            regex.append(".*");
+            segmentStart = index + 1;
+        }
+        if (segmentStart < pattern.length()) {
+            regex.append(Pattern.quote(pattern.substring(segmentStart)));
+        }
+        regex.append("$");
+        return Pattern.compile(regex.toString()).matcher(value).matches();
     }
 
     private boolean looksLikeClosedStream(IOException exception) {
@@ -4109,7 +4258,21 @@ public final class JClaude {
             Optional<String> baseUrl,
             String outputFormat,
             Optional<String> apiKey,
-            SkillRegistry skills
+            SkillRegistry skills,
+            ModelProfile modelProfile
+    ) {
+    }
+
+    private record FileConfig(
+            Map<String, String> values,
+            Map<String, ModelProfileOverride> modelProfiles
+    ) {
+    }
+
+    private record ModelProfileOverride(
+            Integer contextWindowTokens,
+            Integer maxOutputTokens,
+            Boolean supportsVision
     ) {
     }
 
