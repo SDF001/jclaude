@@ -1,5 +1,7 @@
 # jclaude
 
+> **注意：本项目已停止更新。** 因已有 opencode 等成熟的同类产品，jclaude 不再继续开发。代码保留在 v0.1.7 版本供参考。
+
 `jclaude` 是一个使用 Java 21 实现的 Claude Code 风格 CLI，命令名对标 `claude`。当前版本：`0.1.7`。当前通过 Java `HttpClient` 直连 provider 的 HTTP/SSE 接口，支持两种 API 格式：
 
 - `anthropic`：Anthropic Messages API 格式，调用 `/v1/messages`，支持 SSE 流式输出和 tool use。

@@ -2,4 +2,5 @@ target/
 *.class
 .DS_Store
 .claude/settings.local.json
-.jclaude/settings.local.json
+.jclaude/
+.idea/
